@@ -871,7 +871,11 @@ class SessionStore:
             )
             if now.hour < policy.at_hour:
                 today_reset -= timedelta(days=1)
-            if entry.updated_at < today_reset:
+            # Daily resets are anchored to when the session began, not the last
+            # activity time. That keeps outbound cron/live-adapter traffic from
+            # holding a session open past the morning boundary and ensures the
+            # first real inbound after the cutoff starts fresh.
+            if entry.created_at < today_reset:
                 return True
 
         return False
@@ -914,8 +918,12 @@ class SessionStore:
             )
             if now.hour < policy.at_hour:
                 today_reset -= timedelta(days=1)
-            
-            if entry.updated_at < today_reset:
+            # Daily resets are anchored to session creation time, not last
+            # activity time. Outbound cron/live-adapter sends can keep
+            # ``updated_at`` fresh even when the user hasn't started a new day
+            # yet; using ``created_at`` ensures the first inbound after the
+            # cutoff always rolls to a fresh session.
+            if entry.created_at < today_reset:
                 return "daily"
         
         return None

@@ -16,6 +16,7 @@ from gateway.config import (
     SessionResetPolicy,
 )
 from gateway.session import SessionEntry, SessionSource, SessionStore
+import gateway.session as session_module
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +83,23 @@ class TestShouldResetReason:
             session_id="s1",
             created_at=now - timedelta(days=2),
             updated_at=now - timedelta(days=1),  # last active yesterday
+        )
+        source = _make_source()
+        assert store._should_reset(entry, source) == "daily"
+
+    def test_daily_reset_ignores_outbound_keepalive_updates(self, tmp_path, monkeypatch):
+        """Outbound cron/live-adapter activity must not keep a session warm past the daily cutoff."""
+        fixed_now = datetime(2026, 6, 3, 8, 15, 0)
+        monkeypatch.setattr(session_module, "_now", lambda: fixed_now)
+        store = _make_store(
+            SessionResetPolicy(mode="daily", at_hour=6),
+            tmp_path,
+        )
+        entry = SessionEntry(
+            session_key="test",
+            session_id="s1",
+            created_at=datetime(2026, 6, 2, 23, 55, 0),
+            updated_at=datetime(2026, 6, 3, 7, 5, 0),  # cron/outbound activity after 6am
         )
         source = _make_source()
         assert store._should_reset(entry, source) == "daily"
