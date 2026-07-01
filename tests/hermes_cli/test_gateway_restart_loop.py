@@ -43,6 +43,7 @@ class TestGatewayLifecyclePattern:
         "systemctl restart hermes-gateway",
         "systemctl stop hermes-gateway.service",
         "systemctl start hermes-gateway",
+        "systemctl --user restart hermes-gateway.service",
     ])
     def test_service_manager_commands(self, text):
         assert _contains_gateway_lifecycle_command(text), f"Should match: {text!r}"
@@ -67,6 +68,8 @@ class TestGatewayLifecyclePattern:
         "Summarize the API gateway logs and report any restart events from last night",
         "Check if the payment gateway needs a restart after the deploy",
         "Monitor the gateway and tell me if a restart is recommended",
+        "systemctl restart hermes-dashboard",
+        "systemctl --user restart hermes-dashboard.service",
     ])
     def test_safe_commands(self, text):
         assert not _contains_gateway_lifecycle_command(text), f"Should NOT match: {text!r}"
@@ -287,6 +290,8 @@ class TestTerminalToolGatewayLifecycleGuard:
             monkeypatch.setenv("_HERMES_GATEWAY", "1")
         else:
             monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+        monkeypatch.delenv("HERMES_ALLOW_GATEWAY_SELF_LIFECYCLE_COMMANDS", raising=False)
+        monkeypatch.setattr(tt, "_allow_gateway_self_lifecycle_commands", lambda: False)
 
     @pytest.mark.parametrize("cmd", [
         "systemctl restart hermes-gateway",
@@ -315,6 +320,26 @@ class TestTerminalToolGatewayLifecycleGuard:
 
         assert result["exit_code"] == 1
         assert "Blocked" in result["error"]
+
+    def test_opt_in_allows_lifecycle_commands_inside_gateway(self, monkeypatch):
+        import tools.terminal_tool as tt
+
+        calls = []
+
+        class _FakeEnv:
+            env = {}
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                return {"output": "restarting...", "returncode": 0}
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        monkeypatch.setattr(tt, "_allow_gateway_self_lifecycle_commands", lambda: True)
+        monkeypatch.setattr(tt, "_check_all_guards", lambda cmd, env: {"approved": True})
+
+        result = json.loads(tt.terminal_tool(command="systemctl restart hermes-gateway"))
+
+        assert result["exit_code"] == 0
+        assert calls == ["systemctl restart hermes-gateway"]
 
     def test_safe_systemctl_commands_pass_through(self, monkeypatch):
         """Non-hermes systemctl commands must not be blocked by this guard."""

@@ -24,8 +24,8 @@ from hermes_cli.colors import Colors, color
 _GATEWAY_LIFECYCLE_PATTERNS = re.compile(
     r"(?i)"
     r"(hermes\s+gateway\s+(restart|stop|start))"
-    r"|(launchctl\s+(kickstart|unload|load|stop|restart)\s+.*hermes)"
-    r"|(systemctl\s+(-\S+\s+)*(restart|stop|start)\s+.*hermes)"
+    r"|(launchctl\s+(kickstart|unload|load|stop|restart)\s+.*hermes[^\n]*gateway)"
+    r"|(systemctl\s+(-\S+\s+)*(restart|stop|start)\s+.*hermes[-_.]?gateway(\.service)?)"
     r"|(p?kill\s+.*hermes.*gateway)"
 )
 

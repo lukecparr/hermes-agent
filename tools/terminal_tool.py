@@ -257,10 +257,30 @@ from tools.approval import (
 )
 
 
-def _check_all_guards(command: str, env_type: str) -> dict:
+def _check_all_guards(command: str, env_type: str) -> Dict[str, Any]:
     """Delegate to consolidated guard (tirith + dangerous cmd) with CLI callback."""
     return _check_all_guards_impl(command, env_type,
                                   approval_callback=_get_approval_callback())
+
+
+def _allow_gateway_self_lifecycle_commands() -> bool:
+    """Return True when the user explicitly allows gateway self restarts.
+
+    This is intentionally opt-in because the default guard prevents restart
+    loops and half-restarted gateways. Power users who accept that tradeoff can
+    set ``terminal.allow_gateway_self_lifecycle_commands: true`` in config.yaml
+    (or the matching env var for one-off debugging).
+    """
+    raw = os.getenv("HERMES_ALLOW_GATEWAY_SELF_LIFECYCLE_COMMANDS")
+    if raw is not None:
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        terminal_cfg = cfg.get("terminal") or {}
+        return bool(terminal_cfg.get("allow_gateway_self_lifecycle_commands", False))
+    except Exception:
+        return False
 
 
 # Allowlist: characters that can legitimately appear in directory paths.
@@ -2065,7 +2085,10 @@ def terminal_tool(
         # never restart. This mirrors the `hermes gateway restart` guard in
         # hermes_cli/gateway.py and the cron-path guard in hermes_cli/cron.py,
         # but applies unconditionally (force=True cannot help here).
-        if os.environ.get("_HERMES_GATEWAY") == "1":
+        if (
+            os.environ.get("_HERMES_GATEWAY") == "1"
+            and not _allow_gateway_self_lifecycle_commands()
+        ):
             from hermes_cli.cron import _contains_gateway_lifecycle_command
             if _contains_gateway_lifecycle_command(command):
                 return json.dumps({
