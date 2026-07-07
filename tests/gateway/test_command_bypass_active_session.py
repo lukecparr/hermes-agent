@@ -2,7 +2,7 @@
 
 When an agent is running, the base adapter's Level 1 guard in
 handle_message() intercepts all incoming messages and queues them as
-pending.  Certain commands (/stop, /new, /reset, /approve, /deny,
+pending.  Certain commands (/stop, /new, /reset, /approve, /a, /deny, /d,
 /status) must bypass this guard and be dispatched directly to the gateway
 runner — otherwise they are queued as user text and either:
   - leak into the conversation as agent input (/stop, /new), or
@@ -137,6 +137,18 @@ class TestCommandBypassActiveSession:
         assert any("handled:approve" in r for r in adapter.sent_responses)
 
     @pytest.mark.asyncio
+    async def test_approve_short_alias_bypasses_guard(self):
+        """/a alias for /approve must bypass (deadlock prevention)."""
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+
+        await adapter.handle_message(_make_event("/a"))
+
+        assert sk not in adapter._pending_messages
+        assert any("handled:a" in r for r in adapter.sent_responses)
+
+    @pytest.mark.asyncio
     async def test_deny_bypasses_guard(self):
         """/deny must bypass (deadlock prevention)."""
         adapter = _make_adapter()
@@ -147,6 +159,18 @@ class TestCommandBypassActiveSession:
 
         assert sk not in adapter._pending_messages
         assert any("handled:deny" in r for r in adapter.sent_responses)
+
+    @pytest.mark.asyncio
+    async def test_deny_short_alias_bypasses_guard(self):
+        """/d alias for /deny must bypass (deadlock prevention)."""
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+
+        await adapter.handle_message(_make_event("/d"))
+
+        assert sk not in adapter._pending_messages
+        assert any("handled:d" in r for r in adapter.sent_responses)
 
     @pytest.mark.asyncio
     async def test_status_bypasses_guard(self):
@@ -445,6 +469,18 @@ class TestPendingCommandSafetyNet:
 
         assert resolve_command("reset") is not None
         assert resolve_command("reset").name == "new"  # alias
+
+    def test_approve_short_alias_detected(self):
+        from hermes_cli.commands import resolve_command
+
+        assert resolve_command("a") is not None
+        assert resolve_command("a").name == "approve"  # alias
+
+    def test_deny_short_alias_detected(self):
+        from hermes_cli.commands import resolve_command
+
+        assert resolve_command("d") is not None
+        assert resolve_command("d").name == "deny"  # alias
 
     def test_unknown_command_not_detected(self):
         from hermes_cli.commands import resolve_command
