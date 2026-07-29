@@ -15878,12 +15878,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         is_voice_input = (event.message_type == MessageType.VOICE)
 
         adapter = self.adapters.get(event.source.platform)
-        adapter_auto_tts = False
-        if adapter and hasattr(adapter, "_should_auto_tts_for_chat"):
-            try:
-                adapter_auto_tts = bool(adapter._should_auto_tts_for_chat(chat_id))
-            except Exception:
-                adapter_auto_tts = False
+        # Consult only the global config default here. The adapter helper also
+        # returns True for chats opted into ``voice_only`` via /voice on; using
+        # it here collapses voice_only into all and speaks replies to text input.
+        adapter_auto_tts = (
+            getattr(adapter, "_auto_tts_default", False) is True
+            if adapter is not None
+            else False
+        )
 
         should = (
             (voice_mode == "all")

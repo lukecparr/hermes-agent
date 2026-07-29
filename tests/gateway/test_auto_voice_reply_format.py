@@ -119,7 +119,7 @@ class TestAutoVoiceReplyFormat:
         """
         runner = _make_runner()
         adapter = _make_adapter(Platform.TELEGRAM)
-        adapter._should_auto_tts_for_chat = MagicMock(return_value=True)
+        adapter._auto_tts_default = True
         runner.adapters[Platform.TELEGRAM] = adapter
         voice_event = _make_event(
             Platform.TELEGRAM, chat_id="123", message_type=MessageType.VOICE
@@ -133,19 +133,18 @@ class TestAutoVoiceReplyFormat:
         """voice.auto_tts=true should make normal text replies get voice too."""
         runner = _make_runner()
         adapter = _make_adapter(Platform.TELEGRAM)
-        adapter._should_auto_tts_for_chat = MagicMock(return_value=True)
+        adapter._auto_tts_default = True
         runner.adapters[Platform.TELEGRAM] = adapter
         event = _make_event(Platform.TELEGRAM, chat_id="123")
 
         assert runner._should_send_voice_reply(event, "hello", []) is True
-        adapter._should_auto_tts_for_chat.assert_called_once_with("123")
 
     def test_should_send_voice_reply_honors_explicit_voice_off_over_global_auto_tts(self):
         """A chat-level /voice off remains a hard override."""
         runner = _make_runner()
         runner._voice_mode["telegram:123"] = "off"
         adapter = _make_adapter(Platform.TELEGRAM)
-        adapter._should_auto_tts_for_chat = MagicMock(return_value=True)
+        adapter._auto_tts_default = True
         runner.adapters[Platform.TELEGRAM] = adapter
         event = _make_event(Platform.TELEGRAM, chat_id="123")
 
@@ -154,6 +153,12 @@ class TestAutoVoiceReplyFormat:
     def test_should_send_voice_reply_voice_only_still_requires_voice_input(self):
         runner = _make_runner()
         runner._voice_mode["telegram:123"] = "voice_only"
+        adapter = _make_adapter(Platform.TELEGRAM)
+        adapter._auto_tts_default = False
+        # /voice on adds this chat to the adapter's enabled set, so the
+        # adapter-level helper returns True even though global auto-TTS is off.
+        adapter._should_auto_tts_for_chat = MagicMock(return_value=True)
+        runner.adapters[Platform.TELEGRAM] = adapter
         event = _make_event(Platform.TELEGRAM, chat_id="123")
 
         assert runner._should_send_voice_reply(event, "hello", []) is False
