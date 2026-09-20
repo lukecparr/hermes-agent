@@ -97,6 +97,12 @@ class TestResolveCommand:
         assert not ctx.cli_only and not ctx.gateway_only
         assert "context" in GATEWAY_KNOWN_COMMANDS
 
+    def test_approval_commands_have_short_gateway_aliases(self):
+        assert resolve_command("a").name == "approve"
+        assert resolve_command("d").name == "deny"
+        assert "a" in GATEWAY_KNOWN_COMMANDS
+        assert "d" in GATEWAY_KNOWN_COMMANDS
+
 
 # ---------------------------------------------------------------------------
 # Derived dicts (backwards compat)
