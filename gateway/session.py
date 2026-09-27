@@ -926,14 +926,18 @@ class SessionStore(
             sid = observed.session_id
             checks = _RouteChecks(
                 sid, self._compression_tip_for_session_id(sid), self._is_session_ended_in_db(sid),
-                self._route_reset_reason(observed),
+                self._route_reset_reason(
+                    observed, source, now, allow_timer=touch_activity,
+                ),
             )
         # Phase 2 (lock): apply the decisions to _entries.
         decision = self._apply_route_checks(session_key, checks, force_new, touch_activity, now)
 
         # Phase 3 (no lock): recovery + create + save + DB ops.
         if decision.needs_recover and decision.prev_session_id is None:
-            self._route_recover(decision, session_key, source, now)
+            self._route_recover(
+                decision, session_key, source, now, allow_timer=touch_activity,
+            )
         create_kwargs = None
         if decision.entry is None:
             create_kwargs = self._route_create(
@@ -1000,11 +1004,20 @@ class SessionStore(
         return decision
 
     def _route_recover(
-        self, decision: _RouteDecision, session_key: str, source: SessionSource, now: datetime
+        self, decision: _RouteDecision, session_key: str, source: SessionSource, now: datetime,
+        *, allow_timer: bool,
     ) -> None:
         """Adopt a recoverable state.db row, or schedule its reset (no lock held on entry)."""
         recovered = self._query_recoverable_session(session_key=session_key, source=source, now=now)
         if recovered is None:
+            return
+        reset_reason = self._route_reset_reason(
+            recovered, source, now, allow_timer=allow_timer,
+        )
+        if reset_reason:
+            decision.schedule_reset(
+                reset_reason, recovered, recovered.last_prompt_tokens > 0,
+            )
             return
         self._reopen_session_row(session_key, recovered.session_id)
         with self._lock:

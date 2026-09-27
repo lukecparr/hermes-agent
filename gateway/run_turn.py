@@ -537,13 +537,24 @@ class GatewayTurnMixin:
         turn_sidecar_notes.append(context_note)
 
         try:
-            should_notify = reset_reason == "suspended"
+            policy = self.session_store.config.session_reset
+            should_notify = reset_reason == "suspended" or (
+                reset_reason in {"idle", "daily"}
+                and policy.notify
+                and session_entry.reset_had_activity
+                and getattr(source.platform, "value", "") not in policy.notify_exclude_platforms
+            )
             adapter = self._delivery_adapter_for(source) if should_notify else None
             if adapter:
+                reason_text = {
+                    "suspended": "after being stopped",
+                    "idle": f"after {policy.idle_minutes} minutes of inactivity",
+                    "daily": f"at the {policy.at_hour:02d}:00 daily boundary",
+                }.get(reset_reason, "")
                 notice = (
-                    "◐ Session reset after being stopped. "
-                    f"Conversation history cleared.\n"
-                    f"Use /resume to browse and restore a previous session.\n"
+                    f"◐ Session reset {reason_text}. "
+                    "Earlier messages remain available.\n"
+                    "Use /resume to browse and restore a previous session.\n"
                 )
                 with suppress(Exception):
                     session_info = await asyncio.to_thread(self._reset_notice_session_info, source)

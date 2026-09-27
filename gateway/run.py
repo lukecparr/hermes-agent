@@ -3303,9 +3303,11 @@ def _reconnect_needs_attention(info: dict, now: float) -> bool:
 _SESSION_DB_UNPINNED = object()
 
 
-# Only explicit suspension can replace a routed conversation.
+# The sidecar must describe the actual boundary, especially for an opt-in timer.
 _AUTO_RESET_CONTEXT_NOTES = {
     "suspended": "[System note: The user's previous session was stopped and suspended. This is a fresh conversation with no prior context.]",
+    "idle": "[System note: The previous session expired after inactivity. This is a fresh conversation; earlier messages remain available through session search.]",
+    "daily": "[System note: The previous session crossed its configured daily reset boundary. This is a fresh conversation; earlier messages remain available through session search.]",
 }
 
 

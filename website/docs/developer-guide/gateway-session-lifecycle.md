@@ -7,7 +7,7 @@ description: "SessionSource, SessionEntry, SessionStore, session-key rules and m
 
 > **Audience:** Gateway developers and maintainers
 > **Source files:** `gateway/session.py` (~1200 lines + `session_*.py` siblings), `gateway/run.py` (~5500 lines facade + `run_*.py` phases), `gateway/config.py`
-> **Last updated:** 2026-06-16
+> **Last updated:** 2026-09-27
 
 ## Overview
 
@@ -71,7 +71,7 @@ incoming `MessageEvent` and used for routing, isolation, and context injection.
 | `session_key` | `str` | *(required)* | Deterministic key identifying the conversation lane (see §4). |
 | `session_id` | `str` | *(required)* | Unique identifier for this specific conversation incarnation. Format: `YYYYMMDD_HHMMSS_<8hex>`. |
 | `created_at` | `datetime` | *(required)* | When this session incarnation was created. |
-| `updated_at` | `datetime` | *(required)* | Last activity timestamp used for resource housekeeping. |
+| `updated_at` | `datetime` | *(required)* | Last user-activity timestamp used for idle rotation and resource housekeeping. Internal events do not advance it. |
 | `origin` | `Optional[SessionSource]` | `None` | The source that created this session, used for delivery routing. |
 | `display_name` | `Optional[str]` | `None` | Chat display name (sourced from `SessionSource.chat_name`). |
 | `platform` | `Optional[Platform]` | `None` | Platform enum persisted for routing across restarts. |
@@ -92,8 +92,8 @@ behavior on the next access.
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
-| `was_auto_reset` | `bool` | `False` | Set when explicit suspension causes a replacement session. Also retained for historical records. |
-| `auto_reset_reason` | `Optional[str]` | `None` | `"suspended"` for explicit suspension; older rows may retain historical reset reasons. |
+| `was_auto_reset` | `bool` | `False` | Set when suspension or an opt-in timer causes a replacement session. |
+| `auto_reset_reason` | `Optional[str]` | `None` | `"suspended"`, `"idle"`, or `"daily"`. |
 | `reset_had_activity` | `bool` | `False` | Whether the replaced session had prior activity. |
 | `is_fresh_reset` | `bool` | `False` | Set by explicit `/new` or `/reset`. Triggers topic/channel skill re-injection on first message. Distinguished from `was_auto_reset` to avoid misleading "session expired" notices. |
 | `expiry_finalized` | `bool` | `False` | Historical finalization fence retained for recovery; no timer writes it. |
@@ -141,8 +141,9 @@ behavior on the next access.
 
 **Priority order in `get_or_create_session()`:**
 1. `suspended=True` → always force-reset (hard wipe)
-2. `resume_pending=True` → preserve session_id (soft recovery)
-3. No trigger → return existing entry (bump `updated_at`)
+2. Internal event or `resume_pending=True` → preserve session ID and activity clock
+3. User inbound + enabled overdue timer + no active background process → rotate
+4. No trigger → return existing entry and bump `updated_at`
 
 ---
 
@@ -167,8 +168,8 @@ SessionStore(sessions_dir: Path, config: GatewayConfig, has_active_processes_fn=
 
 | Method | Description |
 |---|---|
-| `get_or_create_session(source, force_new=False)` | Core entry point. Returns existing or creates new `SessionEntry`. Evaluates explicit suspension and restart recovery state. Creates/ends SQLite records. |
-| `update_session(session_key, last_prompt_tokens=None)` | Lightweight metadata update after an interaction. Bumps `updated_at`, optionally records `last_prompt_tokens`. |
+| `get_or_create_session(source, force_new=False, touch_activity=True)` | Core entry point. Returns existing or creates new `SessionEntry`. On user ingress, evaluates suspension and the opt-in reset policy; `touch_activity=False` suppresses timer rotation and activity updates for internal events. Creates/ends SQLite records. |
+| `update_session(session_key, last_prompt_tokens=None, touch_activity=True)` | Lightweight metadata update after an interaction. Bumps `updated_at` only for user activity and optionally records `last_prompt_tokens`. |
 | `reset_session(session_key, display_name=None)` | Explicit reset (from `/new` or `/reset`). Creates new `session_id`, sets `is_fresh_reset=True`. Ends old SQLite session, creates new one. |
 | `switch_session(session_key, target_session_id, *, expected_session_id=None)` | Switch to a different existing session ID (from `/resume`). Ends current SQLite session, reopens target. With `expected_session_id=` the repoint is a compare-and-swap: returns `None` without switching when the key no longer points at that session, so a caller that resolved against a snapshot across an `await` (async-delegation re-pin, Telegram topic-binding heal) cannot overwrite a concurrent `/new` or `/resume`. |
 | `suspend_session(session_key)` | Mark session as `suspended=True` (from `/stop`). Forces auto-reset on next access. |
@@ -293,12 +294,19 @@ gateway at runtime, preserving prompt caching (the system prompt doesn't change 
 
 ---
 
-## 6. Explicit Conversation Boundaries
+## 6. Conversation Boundaries
 
-Inactivity and wall-clock time never rotate a conversation. `/new` and `/reset`
-create an explicit boundary; context compression continues to manage long histories.
-Legacy timer configuration is ignored. The existing `SessionResetPolicy` datatype
-is inert compatibility data, not a runtime policy.
+`/new` and `/reset` always create an explicit boundary. Time-triggered rotation is
+disabled by default and enabled with the top-level `session_reset` block. Supported modes
+are `none`, `idle`, `daily`, and `both`; `idle_minutes` must be positive and `at_hour` is
+local time from 0 through 23.
+
+The policy is evaluated synchronously on user ingress. There is no expiry watcher. Internal
+events pass `touch_activity=False`, so completion notices, cron wakes, and restart-resume
+events neither trigger rotation nor extend the idle deadline. A `resume_pending` entry is
+preserved so fresh interrupted-turn recovery wins over the timer. An active background
+process also defers rotation; the next user ingress after work ends evaluates the policy
+against the most recent user activity.
 
 Explicit suspension still creates a boundary on the next inbound turn. Recovery
 respects explicit and historical finalized boundaries rather than reopening them.
@@ -521,8 +529,8 @@ operations always use the original values.
 ## 10. Background Housekeeping
 
 The `_session_housekeeping_watcher` periodically sweeps idle cached agents, sheds
-cache entries under memory pressure, and prunes old routing entries hourly.
-It never ends a transcript because of inactivity or the time of day.
+cache entries under memory pressure, and prunes old routing entries hourly. It never ends a
+transcript because of inactivity or the time of day; timer rotation happens only on ingress.
 
 TTL, LRU and pressure eviction commit the live transcript to memory providers before
 soft-releasing clients. Active turns remain protected; terminal, browser and background
@@ -616,6 +624,9 @@ conversation boundaries and shutdown.
 |---|---|---|---|
 | `group_sessions_per_user` | `bool` | `true` | Isolate group/channel sessions per user |
 | `thread_sessions_per_user` | `bool` | `false` | Isolate thread sessions per user |
+| `session_reset.mode` | `str` | `none` | Inbound rotation policy: `none`, `idle`, `daily`, or `both` |
+| `session_reset.idle_minutes` | `int` | `1440` | Idle threshold in minutes when idle rotation is enabled |
+| `session_reset.at_hour` | `int` | `4` | Daily local-time boundary (0-23) |
 | `session_store_max_age_days` | `int` | `0` | Prune sessions older than N days (0=disabled) |
 | `agent.gateway_auto_continue_freshness` | `int` | `3600` | Seconds for resume freshness window |
 | `agent.gateway_timeout` | `int` | `1800` | Agent turn timeout (30 min default) |
@@ -635,5 +646,5 @@ mode and the explicit repair procedure.
 
 ### Conversation lifetime
 
-No idle or daily reset settings are supported. Explicit `/new` and `/reset`,
-compaction, suspension and crash recovery retain their separate lifecycle roles.
+Idle and daily rotation are opt-in and inbound-triggered. Explicit `/new` and `/reset`,
+compaction, suspension, and crash recovery retain their separate lifecycle roles.

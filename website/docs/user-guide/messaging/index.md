@@ -308,12 +308,20 @@ old behavior: in-flight responses are lost on crash).
 
 ### Session continuity
 
-Gateway conversations do not reset after inactivity or at a daily boundary. Use `/new`
-or `/reset` for an explicit new conversation; context compression remains automatic.
-Legacy `session_reset` settings, reset-policy overrides and reset-timer environment
-variables are ignored. Cached agents may be released to reclaim resources without
-replacing the durable conversation. Restart-recovery freshness limits automatic
-continuation, not the history loaded when you send a message.
+Gateway conversations persist until `/new` or `/reset` by default. Automatic rotation is
+opt-in through the top-level `session_reset` block in `config.yaml`:
+
+```yaml
+session_reset:
+  mode: both       # none (default), idle, daily, or both
+  idle_minutes: 90
+  at_hour: 6       # local time, 0-23
+```
+
+The policy is checked on the next user message, not by a background timer. Active
+background processes defer rotation. Internal wake/notification events do not rotate the
+conversation or advance the idle clock, and fresh restart recovery remains resumable.
+Earlier sessions stay available through `/resume`.
 
 
 ## Per-Channel Model & System Prompt Overrides

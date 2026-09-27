@@ -897,17 +897,26 @@ That reverts groups/channels to a single shared session per room, which preserve
 
 ### Session continuity
 
-Gateway conversations do not reset after inactivity or at a daily boundary. Use `/new`
-or `/reset` for an explicit new conversation; context compression remains automatic.
-Legacy `session_reset` settings, reset-policy overrides and reset-timer environment
-variables are ignored. Cached agents may be released to reclaim resources without
-replacing the durable conversation. Restart-recovery freshness limits automatic
-continuation, not the history loaded when you send a message.
+Gateway conversations persist until `/new` or `/reset` by default. To opt into
+time-triggered rotation, add this top-level block to `config.yaml`:
+
+```yaml
+session_reset:
+  mode: both       # none (default), idle, daily, or both
+  idle_minutes: 90
+  at_hour: 6       # local time, 0-23
+```
+
+The gateway evaluates the policy when the next user message arrives; it does not run a
+background expiry watcher. Active background processes defer rotation, restart recovery
+keeps a freshly interrupted turn resumable, and internal wake/notification events neither
+rotate the session nor advance its idle clock. A rotated conversation remains available
+through `/resume`.
 
 ### Session hygiene: why you should still run `/new`
 
-Because gateway conversations never expire on their own, it is easy to run one
-session for weeks. That works, but it quietly defeats the learning loop and
+With the default `session_reset.mode: none`, it is easy to run one session for
+weeks. That works, but it quietly defeats the learning loop and
 inflates costs:
 
 - **Memory only pays off at boundaries.** `MEMORY.md` / `USER.md` are injected
@@ -934,8 +943,8 @@ See [Memory](features/memory.md) for what gets carried across boundaries.
 ### Continuity After Crashes and Restarts
 
 A gateway chat is designed to be **one continuous session** — compacted
-repeatedly as it grows — until you explicitly run `/new` (or `/reset`). This
-holds across gateway crashes, restarts, and updates:
+repeatedly as it grows — until you explicitly run `/new` (or `/reset`) or opt
+into `session_reset`. This holds across gateway crashes, restarts, and updates:
 
 - Session identity (routing key, chat, origin) is written **atomically** when
   the session row is created, on every creation path (`/new`, first message,
@@ -944,10 +953,10 @@ holds across gateway crashes, restarts, and updates:
 - After a restart, the gateway re-resolves each chat to the session with the
   most recent **actual activity** — an older, stale row can never win over the
   conversation you were actually having.
-- Recovery **respects `/new` boundaries**: if the most recent event for a chat
+- Recovery **respects conversation boundaries**: if the most recent event for a chat
   is an intentional reset, recovery starts fresh rather than reaching behind
-  the reset to resurrect an older session. Elapsed time alone never prevents
-  recovery of a durable conversation.
+  the reset to resurrect an older session. An overdue opt-in timer is applied
+  on the first user message after recovery, not during gateway startup.
 
 
 ## Storage Locations

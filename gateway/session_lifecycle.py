@@ -55,7 +55,31 @@ def auto_continue_freshness_window() -> float:
 
 
 class SessionLifecycleMixin:
-    """SessionStore explicit boundaries and crash-recovery markers."""
+    """SessionStore inbound reset policy and crash-recovery markers."""
+
+    @staticmethod
+    def _policy_reset_reason(policy, updated_at: datetime, now: datetime) -> Optional[str]:
+        """Return the first elapsed policy boundary, or ``None`` when disabled/not due."""
+        if policy.mode == "none":
+            return None
+        try:
+            due = []
+            if policy.mode in {"idle", "both"}:
+                idle_boundary = updated_at + timedelta(minutes=policy.idle_minutes)
+                if now > idle_boundary:
+                    due.append((idle_boundary, "idle"))
+            if policy.mode in {"daily", "both"}:
+                daily_boundary = now.replace(
+                    hour=policy.at_hour, minute=0, second=0, microsecond=0
+                )
+                if now.hour < policy.at_hour:
+                    daily_boundary -= timedelta(days=1)
+                if updated_at < daily_boundary:
+                    due.append((daily_boundary, "daily"))
+            return min(due)[1] if due else None
+        except TypeError:
+            # Mixed aware/naive timestamps should preserve history, not force a boundary.
+            return None
 
     def _is_session_ended_in_db(self, session_id: str) -> bool:
         """True iff state.db has this session with a non-null end_reason (same staleness test as
@@ -80,9 +104,27 @@ class SessionLifecycleMixin:
             return False
         return bool(row is not None and row.get("end_reason") is not None)
 
-    def _route_reset_reason(self, entry: SessionEntry) -> Optional[str]:
-        """Only explicit suspension replaces a routed conversation; time never does."""
-        return "suspended" if entry.suspended else None
+    def _route_reset_reason(
+        self, entry: SessionEntry, source: SessionSource, now: datetime, *, allow_timer: bool
+    ) -> Optional[str]:
+        """Choose an inbound boundary without disrupting internal or restart-resume turns."""
+        if entry.suspended:
+            return "suspended"
+        if not allow_timer:
+            return None
+        if entry.resume_pending:
+            window = auto_continue_freshness_window()
+            marker = entry.last_resume_marked_at or entry.updated_at
+            try:
+                if window <= 0 or (now - marker).total_seconds() <= window:
+                    return None
+            except TypeError:
+                return None
+        session_key = self._generate_session_key(source)
+        if self._has_active_processes_safe(session_key, context="reset"):
+            logger.debug("Session reset skipped for %s — active background processes", session_key)
+            return None
+        return self._policy_reset_reason(self.config.session_reset, entry.updated_at, now)
 
     def _update_entry(self, session_key: str, mutate) -> bool:
         """Apply ``mutate(entry)`` under ``_lock`` and full-save; False when the entry is missing
