@@ -10,7 +10,7 @@ import threading
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, fields
-from typing import Dict, List, Optional, Any
+from typing import Any, Callable, Dict, List, NamedTuple, Optional
 
 from .config import Platform, GatewayConfig, HomeChannel
 from .whatsapp_identity import canonical_whatsapp_identifier
@@ -727,6 +727,12 @@ def build_session_key(
     return ":".join(str(part) for part in parts)
 
 
+class ResetIfResult(NamedTuple):
+    """Outcome of :meth:`SessionStore.reset_session_if` (``status`` + the entry it refers to)."""
+    status: str
+    entry: Optional["SessionEntry"]
+
+
 class _SessionFlight:
     def __init__(self) -> None:
         self.event = threading.Event()
@@ -1147,22 +1153,70 @@ class SessionStore(
             if old_entry.origin and old_entry.origin.platform == Platform.LOCAL:
                 from gateway.session_local_recovery import reset_local_session
                 return reset_local_session(self, old_entry, session_id, now, display_name)
-            new_entry = self._replace_route_locked(
-                session_key, old_entry, session_id, now,
-                display_name=display_name if display_name is not None else old_entry.display_name,
-                is_fresh_reset=True,
-            )
-            db_create_kwargs = self._session_create_kwargs(
-                session_id=session_id, session_key=session_key, origin=old_entry.origin,
-                source_value=old_entry.platform.value if old_entry.platform else "unknown",
-                display_name=old_entry.display_name, parent_session_id=old_entry.session_id,
-            )
+            new_entry, db_create_kwargs = self._publish_reset_locked(
+                session_key, old_entry, session_id, now, display_name)
+        self._finish_reset_transition(session_key, old_entry, new_entry, db_create_kwargs)
+        return new_entry
+
+    def reset_session_if(
+        self, session_key: str, *, expected_session_id: str,
+        should_reset: Callable[[SessionEntry], bool], metadata: Optional[dict[str, Any]] = None,
+    ) -> ResetIfResult:
+        """Compare-and-rotate a messaging route (the time-boundary resets of an out-of-tree
+        policy, which can race a Telegram first message against another in-process caller).
+
+        Under ONE hold of ``_lock`` the route must still name ``expected_session_id``, carry no
+        ``active_turn_token``, have no ``get_or_create_session`` in flight, and satisfy
+        ``should_reset(entry)`` (called with the lock held: it must be pure and must not call back
+        into this store). Only then is it rotated exactly like :meth:`reset_session`, with
+        ``metadata`` (copied) seeded on the fresh entry. Statuses: ``reset`` (entry = new),
+        ``moved`` (entry = current route, e.g. a concurrent ``/new`` or reset won), ``busy``,
+        ``not_due``, ``no_route``, ``unsupported`` (LOCAL routes keep their own lineage reset).
+        Cross-process turn leases and queued admissions live outside this store: callers that
+        can see them check them first. A raising predicate propagates and rotates nothing.
+        """
+        if not expected_session_id:
+            raise ValueError("expected_session_id is required")
+        with self._lock:
+            old_entry = self._entry_locked(session_key)
+            if old_entry is None:
+                return ResetIfResult("no_route", None)
+            if old_entry.session_id != expected_session_id:
+                return ResetIfResult("moved", old_entry)
+            if old_entry.origin and old_entry.origin.platform == Platform.LOCAL:
+                return ResetIfResult("unsupported", old_entry)
+            inflight = getattr(self, "_inflight_sessions", None) or {}
+            if old_entry.active_turn_token or session_key in inflight:
+                return ResetIfResult("busy", old_entry)
+            if not should_reset(old_entry):
+                return ResetIfResult("not_due", old_entry)
+            now = _now()
+            new_entry, db_create_kwargs = self._publish_reset_locked(
+                session_key, old_entry, _new_session_id(now), now, None,
+                metadata=dict(metadata or {}))
+        self._finish_reset_transition(session_key, old_entry, new_entry, db_create_kwargs)
+        return ResetIfResult("reset", new_entry)
+
+    def _publish_reset_locked(self, session_key, old_entry, session_id, now, display_name, **fields):
+        """Publish the fresh reset entry (lock held); returns it with its row-create kwargs."""
+        new_entry = self._replace_route_locked(
+            session_key, old_entry, session_id, now,
+            display_name=display_name if display_name is not None else old_entry.display_name,
+            is_fresh_reset=True, **fields,
+        )
+        db_create_kwargs = self._session_create_kwargs(
+            session_id=session_id, session_key=session_key, origin=old_entry.origin,
+            source_value=old_entry.platform.value if old_entry.platform else "unknown",
+            display_name=old_entry.display_name, parent_session_id=old_entry.session_id,
+        )
+        return new_entry, db_create_kwargs
+
+    def _finish_reset_transition(self, session_key, old_entry, new_entry, db_create_kwargs) -> None:
         self._finish_route_transition(
             session_key, end_session_id=old_entry.session_id, end_reason="session_reset",
             create_kwargs=db_create_kwargs, origin=old_entry.origin,
             display_name=new_entry.display_name, during=" during reset",
         )
-        return new_entry
 
     def _replace_route_locked(self, session_key, old_entry, session_id, now, **fields) -> SessionEntry:
         """Publish a fresh entry (inheriting origin/platform/chat_type) and save. Lock held."""
