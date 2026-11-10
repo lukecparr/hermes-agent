@@ -368,9 +368,11 @@ def _route_envelope_before_reset(authority, route):
     """Latest committed human (``messaging:*``) envelope on ``route`` across sessions, or None."""
     # Filter on the route in SQL: a global "latest N messaging rows" window misses a quiet DM
     # whenever other routes (groups, other platforms) were busier since its last human message.
+    # CASE guards json_extract: one malformed payload would otherwise fail the whole query.
     with authority.db._read_ctx() as conn:
         rows = conn.execute("SELECT payload_json FROM session_admissions WHERE principal_id LIKE 'messaging:%' "
-                            "AND json_extract(payload_json, '$.native_text_v1.route') = ? "
+                            "AND CASE WHEN json_valid(payload_json) "
+                            "THEN json_extract(payload_json, '$.native_text_v1.route') END = ? "
                             "ORDER BY seq DESC LIMIT ?", (route, _ROUTE_FALLBACK_SCAN)).fetchall()
     for (raw,) in rows:
         try:

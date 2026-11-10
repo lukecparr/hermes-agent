@@ -58,6 +58,14 @@ def test_fallback_finds_a_quiet_route_behind_busier_routes():
     assert sa._route_envelope_before_reset(authority, ROUTE)["source"]["tag"] == "quiet-dm"
 
 
+def test_fallback_skips_a_corrupt_payload_instead_of_failing_the_query():
+    authority = _authority([("messaging:[1]", _native(ROUTE, tag="good"))])
+    with authority.db._read_ctx() as conn:
+        conn.execute("INSERT INTO session_admissions(principal_id,payload_json) VALUES(?,?)",
+                     ("messaging:[1]", "{not json"))
+    assert sa._route_envelope_before_reset(authority, ROUTE)["source"]["tag"] == "good"
+
+
 def test_committed_route_envelope_falls_back_only_when_asked(monkeypatch):
     authority = _authority([("messaging:[1]", _native(ROUTE, tag="before-reset"))])
     authority.logical_owner = lambda sid: sid
