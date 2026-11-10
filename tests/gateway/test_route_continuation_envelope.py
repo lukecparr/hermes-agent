@@ -51,6 +51,13 @@ def test_fallback_borrows_latest_human_envelope_of_the_same_route_only():
     assert sa._route_envelope_before_reset(authority, "agent:main:telegram:dm:7") is None
 
 
+def test_fallback_finds_a_quiet_route_behind_busier_routes():
+    busy = [("messaging:[2]", _native("agent:main:telegram:group:-5", tag=f"g{i}"))
+            for i in range(sa._ROUTE_FALLBACK_SCAN + 50)]
+    authority = _authority([("messaging:[1]", _native(ROUTE, tag="quiet-dm")), *busy])
+    assert sa._route_envelope_before_reset(authority, ROUTE)["source"]["tag"] == "quiet-dm"
+
+
 def test_committed_route_envelope_falls_back_only_when_asked(monkeypatch):
     authority = _authority([("messaging:[1]", _native(ROUTE, tag="before-reset"))])
     authority.logical_owner = lambda sid: sid
