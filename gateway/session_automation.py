@@ -330,16 +330,53 @@ def _route_identity(source):
     return {key: value for key, value in source.to_dict().items() if key != 'message_id'}
 
 
-def committed_route_envelope(authority, entry):
+def committed_route_envelope(authority, entry, *, route_fallback=False):
     """The route's last committed native envelope with connector provenance (what a producer turn
-    borrows), or ``None`` while no human message was admitted there."""
+    borrows), or ``None`` while no human message was admitted there.
+
+    ``route_fallback`` (Luke's fork, opt-in per producer, see ``ROUTE_CONTINUATION_PRODUCERS``):
+    when the CURRENT session has none yet -- it was just rotated by /new or an idle/daily reset --
+    borrow the latest human envelope committed on the SAME route (same chat, same connector) in an
+    earlier session. ``snapshot_automation`` still re-derives the source and revalidates its
+    provenance against the live connector, so this continues a chat the platform delivered; it
+    never opens one."""
     from hermes_state_runtime import list_session_admissions
     # Admissions belong to the logical root; ``entry.session_id`` is only the transcript tip.
     prior = list_session_admissions(authority.db, session_id=authority.logical_owner(entry.session_id),
                                     pending_only=False)
     envelope = next((r['payload']['native_text_v1'] for r in reversed(prior)
                      if 'native_text_v1' in r['payload']), None)
-    return envelope if envelope is not None and 'provenance' in envelope else None
+    if envelope is not None and 'provenance' in envelope:
+        return envelope
+    return _route_envelope_before_reset(authority, entry.session_key) if route_fallback else None
+
+
+# Producers whose admissions may continue a freshly reset route (identity[0] of the admission).
+ROUTE_CONTINUATION_PRODUCERS = frozenset({'piper-shared-thread'})
+_ROUTE_FALLBACK_SCAN = 500
+
+
+def _continues_route(identity):
+    try:
+        parsed = json.loads(identity) if isinstance(identity, str) and identity.startswith('[') else None
+    except ValueError:
+        return False
+    return isinstance(parsed, list) and bool(parsed) and parsed[0] in ROUTE_CONTINUATION_PRODUCERS
+
+
+def _route_envelope_before_reset(authority, route):
+    """Latest committed human (``messaging:*``) envelope on ``route`` across sessions, or None."""
+    with authority.db._read_ctx() as conn:
+        rows = conn.execute("SELECT payload_json FROM session_admissions WHERE principal_id LIKE 'messaging:%' "
+                            "ORDER BY seq DESC LIMIT ?", (_ROUTE_FALLBACK_SCAN,)).fetchall()
+    for (raw,) in rows:
+        try:
+            envelope = json.loads(raw).get('native_text_v1')
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if isinstance(envelope, dict) and envelope.get('route') == route and 'provenance' in envelope:
+            return envelope
+    return None
 
 
 def snapshot_automation(authority, adapter, event, identity):
@@ -356,7 +393,7 @@ def snapshot_automation(authority, adapter, event, identity):
         return snapshot_local_automation(authority, adapter, event, identity, entry)
     from gateway.session_envelope import restore_native
     owner = authority.logical_owner(entry.session_id)
-    envelope = committed_route_envelope(authority, entry)
+    envelope = committed_route_envelope(authority, entry, route_fallback=_continues_route(identity))
     if envelope is None:
         raise RuntimeStoreError('not_found')
     # Persisted origins deliberately omit relay trust. Borrow only an exact
