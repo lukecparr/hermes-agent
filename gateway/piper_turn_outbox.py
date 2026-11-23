@@ -37,7 +37,10 @@ def insert_completion(conn, admission_id, turn_id):
     conn.execute('''CREATE TABLE IF NOT EXISTS piper_turn_outbox (
         admission_id TEXT PRIMARY KEY, turn_id TEXT NOT NULL,
         event_type TEXT NOT NULL CHECK (event_type = 'piper.turn.completed.v1'),
-        created_at INTEGER NOT NULL DEFAULT (unixepoch()))''')
+        created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+        state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'leased', 'sent', 'blocked')),
+        attempts INTEGER NOT NULL DEFAULT 0, next_attempt INTEGER NOT NULL DEFAULT 0,
+        lease_token TEXT, lease_until INTEGER)''')
     conn.execute('''INSERT INTO piper_turn_outbox(admission_id, turn_id, event_type)
         VALUES (?, ?, 'piper.turn.completed.v1') ON CONFLICT(admission_id) DO NOTHING''',
         (admission_id, turn_id))

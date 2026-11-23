@@ -93,6 +93,29 @@ def test_a_gateway_notice_without_an_agent_result_is_not_a_reply(owner, monkeypa
     assert events(owner) == []
 
 
+@pytest.mark.asyncio
+async def test_captured_unknown_recovery_commits_one_event(owner, monkeypatch):
+    from gateway.session_authority import LiveSession
+    from gateway.session_contract import Principal, SessionRef
+    monkeypatch.setenv('PIPER_TURN_OUTBOX_ROUTE', ROUTE)
+    row = claim(owner)
+    owner.sessions[TURN] = LiveSession(None, ROUTE)
+    owner.pending_results[row['admission_id']] = {
+        'result': {'final_response': 'answer', 'messages': [], 'completed': True}, 'usage': {}}
+    owner.db._execute_write(lambda conn: conn.execute(
+        "UPDATE session_admissions SET status='unknown' WHERE admission_id=?", (row['admission_id'],)))
+    async def resolved(_ref, _id, _prepared, _captured, result):
+        return result
+    monkeypatch.setattr(owner, '_resolved_unknown', resolved)
+    actor = Principal('human', owner.profile_id, frozenset({'session:control', 'session:submit'}), 'test')
+    ref = SessionRef(owner.profile_id, TURN)
+    result = await owner.resolve_unknown(actor, ref, row['admission_id'], row['generation'])
+    assert result['outcome'] == 'completed'
+    assert events(owner) == [(row['admission_id'], TURN, 'piper.turn.completed.v1')]
+    await owner.resolve_unknown(actor, ref, row['admission_id'], row['generation'])
+    assert len(events(owner)) == 1
+
+
 def test_outbox_failure_rolls_back_settlement(owner, monkeypatch):
     import gateway.piper_turn_outbox as outbox
     monkeypatch.setenv('PIPER_TURN_OUTBOX_ROUTE', ROUTE)

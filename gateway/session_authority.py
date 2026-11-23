@@ -828,14 +828,22 @@ class SessionAuthority:
         # claimed with the discarded text left open to be merged into its request. With a captured
         # result the answer is normally already the transcript tail, so the closer is a no-op.
         from gateway.session_results import close_discarded_turn
+        from gateway.piper_turn_outbox import eligible_turn, insert_completion
+        live_route = self.sessions[ref.session_id].route
+        answer = (captured or {}).get('result') or {}
+        turn_id = (eligible_turn(before, live_route, answer.get('final_response'), prepared[0])
+                   if prepared is not None and answer.get('completed') is True else None)
+        def terminal_write(conn, lost):
+            same_owner = prepared is not None and lost['owner_epoch'] == self.epoch
+            close_discarded_turn(self.db, conn, lost, None if same_owner else notice)
+            if same_owner and turn_id is not None:
+                insert_completion(conn, admission_id, turn_id)
         from gateway.session_runtime_workers import tracked_write
         return await tracked_write(self, partial(
             resolve_unknown_session_input, self.db, epoch=self.epoch, admission_id=admission_id,
             generation=generation, _captured=prepared,
-            # ``notice`` says the turn was interrupted: only when that is the outcome, never beside a
-            # captured result this resolution commits as the turn's own answer.
-            _terminal_write=lambda conn, lost: close_discarded_turn(self.db, conn, lost, None if (
-                prepared is not None and lost['owner_epoch'] == self.epoch) else notice)),
+            # The captured result and its outbox record commit in the same resolution transaction.
+            _terminal_write=terminal_write),
             then=partial(self._resolved_unknown, ref, admission_id, prepared, captured))
 
     async def _resolved_unknown(self, ref, admission_id, prepared, captured, row):

@@ -1,6 +1,6 @@
 # Piper shared-thread completion outbox (experimental)
 
-This branch is one isolated producer slice, not a push implementation. Leave it disabled. It does not send HTTP or FCM and does not modify the installed gateway. Do not deploy it as an end-to-end notification feature.
+This branch is an isolated experimental producer and sender, not a push implementation. Leave it disabled. The sender is an explicitly invoked function, not a scheduled service; no HTTP receiver, FCM dispatch or deployment is included.
 
 The installed `piper-shared-thread` plugin admits Second Brain web inputs through the existing gateway authority as `automation:<route>`, with request identity JSON `["piper-shared-thread","second-brain-web",turn_id]`. The normal in-process authority drain calls `commit_and_publish` -> `finish_result` -> `settle_session_input`. The latter commits the terminal admission, result and `_terminal_write` in one SQLite transaction. `admission_id` is created as a UUID on admission; exact admission replay returns the existing row. The plugin also keeps its own turn-id ledger. The outbox stores both ids, without message text or credentials.
 
@@ -8,8 +8,8 @@ When the optional `PIPER_TURN_OUTBOX_ROUTE` environment variable exactly equals 
 
 ## Limitations and next steps
 
-- This only records the normal in-process settlement path. Managed-worker paths that have already committed their result before `finish_result` are not covered; other resolution/recovery routes need auditing. Do not enable until those gaps, real gateway configuration and end-to-end integration are tested.
-- There is no transport, reader, acknowledgements, deletion/retention, retry worker, per-device tracking or FCM integration. This table will grow indefinitely if enabled. Existing Second Brain FCM code alone does not consume it. This branch cannot notify an app, open or closed.
+- The authority's captured-result unknown-resolution path now writes the outbox in the same transaction, tested with a simulated same-owner recovery. Managed workers hand accepted results to the normal drain; the full managed-worker suite could not run in this linked worktree because the test home-I/O guard blocks the active checkout's Git metadata. Other resolution/recovery routes still need auditing. Do not enable until those gaps and real gateway configuration are verified.
+- The sender leases records in SQLite, sends a minimal JSON body over HTTPS (HTTP allowed only to loopback) with a separate bearer credential, blocks non-retryable 4xx, retries transient/ambiguous outcomes with the same event ID and fences stale lease holders. It is not wired to a scheduler. The receiver must commit event deduplication before returning 2xx; no receiver, per-device tracking, FCM integration, retention or operator UI exists. This table will grow indefinitely if enabled.
 - Future transport must authenticate and retry the same event ID across restarts, and the receiving service must durably deduplicate. A database/FCM timeout after acceptance can still cause a duplicate alert or a lost alert; exactly-once display cannot be promised from a server outbox alone.
 - Telegram, Charm/Deck sidecar exchanges, process/cron notices and other producer turns are intentionally out of scope, rather than blocking Second Brain web turns. Telegram remains unchanged. The current route is Telegram-backed, so removing Telegram dependency requires a separate shared-authority migration; do not silently redirect to the native phone-relay thread.
 - Verify actual Android permission, a registered token, Firebase server credentials, generic private notification payload, app-closed/cold-start tap into the shared `/piper` route, and OS force-stop behavior on a device. No phone test has occurred.
