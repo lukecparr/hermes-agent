@@ -11,6 +11,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from gateway.piper_turn_outbox import ensure_terminal_column
+
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -32,6 +34,7 @@ def claim(conn, now, lease_seconds=120):
     """Lease one due row; a dead process's lease becomes eligible after expiry."""
     conn.execute('BEGIN IMMEDIATE')
     try:
+        ensure_terminal_column(conn)
         row = conn.execute('''SELECT admission_id,turn_id,event_type,attempts FROM piper_turn_outbox
             WHERE (state='pending' AND next_attempt<=?) OR (state='leased' AND lease_until<=?)
             ORDER BY created_at,admission_id LIMIT 1''', (now, now)).fetchone()
@@ -65,6 +68,7 @@ def post_event(url, token, event):
 def send_one(conn, url, token, *, now=None, transport=post_event):
     """Attempt one event. An ambiguous network result retries the same event ID."""
     validate_config(url, token)
+    simulated_time = now is not None
     now = int(time.time()) if now is None else int(now)
     event = claim(conn, now)
     if event is None:
@@ -79,9 +83,9 @@ def send_one(conn, url, token, *, now=None, transport=post_event):
         next_attempt = now + min(3600, 2 ** min(event['attempt'], 11))
     conn.execute('BEGIN IMMEDIATE')
     try:
-        changed = conn.execute('''UPDATE piper_turn_outbox SET state=?,next_attempt=?,lease_token=NULL,lease_until=NULL
+        changed = conn.execute('''UPDATE piper_turn_outbox SET state=?,next_attempt=?,lease_token=NULL,lease_until=NULL,terminal_at=?
             WHERE admission_id=? AND state='leased' AND lease_token=?''',
-            (state, next_attempt, event['event_id'], event['lease'])).rowcount
+            (state, next_attempt, (now if simulated_time else int(time.time())) if state in ('sent', 'blocked') else None, event['event_id'], event['lease'])).rowcount
         conn.commit()
     except BaseException:
         conn.rollback()

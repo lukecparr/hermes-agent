@@ -32,6 +32,13 @@ def eligible_turn(row, route, response, outcome):
     return identity[2]
 
 
+def ensure_terminal_column(conn):
+    """Upgrade an existing experimental outbox; legacy rows remain NULL and retained."""
+    columns = {row[1] for row in conn.execute('PRAGMA table_info(piper_turn_outbox)')}
+    if columns and 'terminal_at' not in columns:
+        conn.execute('ALTER TABLE piper_turn_outbox ADD COLUMN terminal_at INTEGER')
+
+
 def insert_completion(conn, admission_id, turn_id):
     """Idempotent within the caller's transaction; stores no conversation content."""
     conn.execute('''CREATE TABLE IF NOT EXISTS piper_turn_outbox (
@@ -40,7 +47,8 @@ def insert_completion(conn, admission_id, turn_id):
         created_at INTEGER NOT NULL DEFAULT (unixepoch()),
         state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'leased', 'sent', 'blocked')),
         attempts INTEGER NOT NULL DEFAULT 0, next_attempt INTEGER NOT NULL DEFAULT 0,
-        lease_token TEXT, lease_until INTEGER)''')
+        lease_token TEXT, lease_until INTEGER, terminal_at INTEGER)''')
+    ensure_terminal_column(conn)
     conn.execute('''INSERT INTO piper_turn_outbox(admission_id, turn_id, event_type)
         VALUES (?, ?, 'piper.turn.completed.v1') ON CONFLICT(admission_id) DO NOTHING''',
         (admission_id, turn_id))
