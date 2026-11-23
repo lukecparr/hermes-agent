@@ -63,7 +63,8 @@ def prepare_result(row, response, outcome, result=None):
     return outcome, _redacted(compact_result(result, user_message=row['payload'].get('text')))
 
 
-def finish_result(db, *, epoch, row, response, outcome, result=None, prepared=None, transfers=None):
+def finish_result(db, *, epoch, row, response, outcome, result=None, prepared=None, transfers=None,
+                  piper_route=None):
     """Delivery failure cannot rewrite an already committed execution outcome.
 
     `result` is the exact structured result captured in-process; the managed
@@ -95,11 +96,19 @@ def finish_result(db, *, epoch, row, response, outcome, result=None, prepared=No
     notice, display_metadata = owner_stop_notice(result, outcome, row), None
     if notice is None and (refusal := gateway_refusal_boundary(result, outcome)) is not None:
         notice, display_metadata = refusal
-    write = None if notice is None else (lambda conn, _current: close_discarded_turn(
-        db, conn, row, notice, replace_after=row.get('transcript_mark'), display_metadata=display_metadata))
+    from gateway.piper_turn_outbox import eligible_turn, insert_completion
+    agent_result = (result or {}).get('result') or {}
+    turn_id = eligible_turn(row, piper_route, response, outcome) if agent_result.get('completed') is True else None
+    def write(conn, _current):
+        if notice is not None:
+            close_discarded_turn(db, conn, row, notice, replace_after=row.get('transcript_mark'),
+                                 display_metadata=display_metadata)
+        if turn_id is not None:
+            insert_completion(conn, row['admission_id'], turn_id)
+    terminal_write = write if notice is not None or turn_id is not None else None
     settled = settle_session_input(db, epoch=epoch, admission_id=row['admission_id'],
         generation=row['generation'], outcome=outcome, result=stored, _transfers=transfers,
-        _terminal_write=write)
+        _terminal_write=terminal_write)
     return settled, response
 
 
