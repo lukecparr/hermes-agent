@@ -42,6 +42,18 @@ def test_expired_lease_redelivers_same_id(db):
     assert reclaimed['lease'] != event['lease']
 
 
+def test_expired_lease_recovers_after_connection_restart(tmp_path):
+    db_path = tmp_path / 'recover.db'
+    with sqlite3.connect(db_path, isolation_level=None) as conn:
+        insert_completion(conn, 'admission-restart', 'web-1234567890123456')
+        old = claim(conn, 100, lease_seconds=10)
+        assert old['event_id'] == 'admission-restart'
+    with sqlite3.connect(db_path, isolation_level=None) as conn:
+        assert send_one(conn, 'https://example.test/piper', TOKEN, now=109, transport=lambda *_: 204) == 'empty'
+        assert send_one(conn, 'https://example.test/piper', TOKEN, now=110, transport=lambda *_: 204) == 'sent'
+        assert conn.execute('SELECT state, attempts FROM piper_turn_outbox').fetchone() == ('sent', 2)
+
+
 def test_permanent_failure_blocks_and_transient_retries(db):
     assert send_one(db, 'https://example.test/piper', TOKEN, now=1, transport=lambda *_: 401) == 'blocked'
     assert send_one(db, 'https://example.test/piper', TOKEN, now=4000, transport=lambda *_: 200) == 'empty'
