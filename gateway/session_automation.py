@@ -7,6 +7,7 @@ from copy import deepcopy
 from datetime import UTC, datetime
 import json
 import logging
+import re
 
 from gateway.config import Platform
 from gateway.platforms.event import MessageEvent, MessageType
@@ -388,13 +389,16 @@ def snapshot_automation(authority, adapter, event, identity):
     runner = authority.runner
     if (not event.internal or event.message_type != MessageType.TEXT or event.is_command()
             or not isinstance(event.text, str) or not identity
-            or event.media_urls or event.prompt_response or event.source.platform == Platform.API_SERVER
+            or (event.media_urls and not _shared_thread_media_identity(identity))
+            or event.prompt_response or event.source.platform == Platform.API_SERVER
             or set(event.metadata) - _AUTOMATION_METADATA):
         raise RuntimeStoreError('invalid_params')
     notification = (automation_notification_metadata(event.metadata) | automation_display_metadata(event.metadata)
                     | _tick_metadata(event.metadata))
     entry = _owner(runner, event, authority)
     if event.source.platform == Platform.LOCAL:
+        if event.media_urls:
+            raise RuntimeStoreError('invalid_params')
         return snapshot_local_automation(authority, adapter, event, identity, entry)
     from gateway.session_envelope import restore_native
     owner = authority.logical_owner(entry.session_id)
@@ -504,12 +508,81 @@ def restore_local_automation(authority, ref, row):
     return event
 
 
+def _shared_thread_media_identity(identity):
+    try:
+        value = json.loads(identity)
+    except (TypeError, ValueError):
+        return False
+    return (isinstance(value, list) and len(value) == 3 and value[0] == 'piper-shared-thread'
+            and isinstance(value[1], str) and re.fullmatch(r'[a-z0-9][a-z0-9-]{1,31}', value[1]) is not None
+            and isinstance(value[2], str) and re.fullmatch(r'[A-Za-z0-9_-]{8,64}', value[2]) is not None)
+
+
+async def _admit_automation_media(authority, adapter, event, identity, replaces):
+    import asyncio
+    from pathlib import Path
+    from hermes_constants import get_hermes_home
+    from gateway.session_ingress_media import abandon_capture, capture_lease, capture_native_media
+    if (not _shared_thread_media_identity(identity) or replaces is not None
+            or not isinstance(event.media_urls, list) or not 1 <= len(event.media_urls) <= 3
+            or not isinstance(event.media_types, list) or len(event.media_types) != len(event.media_urls)
+            or any(m not in {'image/png', 'image/jpeg', 'image/gif', 'image/webp',
+                             'application/pdf', 'text/plain'} for m in event.media_types)):
+        raise RuntimeStoreError('invalid_params')
+    root = get_hermes_home().resolve() / 'piper-shared-thread' / 'attachments'
+    if root.resolve() != root:
+        raise RuntimeStoreError('invalid_params')
+    paths = [Path(path) for path in event.media_urls]
+    if any(not p.is_absolute() or p.parent.parent != root or p.resolve() != p for p in paths):
+        raise RuntimeStoreError('invalid_params')
+    payload, entry = snapshot_automation(authority, adapter, event, identity)
+    with capture_lease(authority) as scope:
+        try:
+            references = await asyncio.to_thread(capture_native_media, paths)
+            if sum(ref['size'] for ref in references) > 5 * 1024 * 1024:
+                raise RuntimeStoreError('invalid_params')
+            # A reset or connector change while bytes were being captured must
+            # not retarget this producer to a different conversation.
+            again, current = snapshot_automation(authority, adapter, event, identity)
+            if current.session_id != entry.session_id or again != payload:
+                raise RuntimeStoreError('admission_conflict')
+            payload['native_text_v1']['media'] = references
+            payload['native_text_v1']['event']['media_types'] = list(event.media_types)
+            payload['native_text_v1']['event']['media_text_inlined'] = [False] * len(references)
+            return await _admit_automation(authority, adapter, event, identity, replaces,
+                                           payload_entry=(payload, entry))
+        except BaseException:
+            await abandon_capture(scope)
+            raise
+
+
+def _write_automation(authority, entry, ref, identity, payload, authorize):
+    from gateway.session_ingress_media import reconcile_native_retry
+    principal = 'automation:' + entry.session_key
+    if payload.get('native_text_v1', {}).get('media'):
+        payload = reconcile_native_retry(authority.db, principal_id=principal, session_id=ref.session_id,
+                                         request_id=identity, payload=payload)
+    return admit_session_input(authority.db, epoch=authority.epoch, principal_id=principal,
+                               session_id=ref.session_id, request_id=identity, payload=payload,
+                               _authorize_write=authorize)
+
+
 async def admit_automation(authority, adapter, event, identity, replaces=None):
+    if event.media_urls:
+        from gateway.session_runtime_workers import track_mutation
+        # Keep the lease and write alive even if the HTTP caller disconnects.
+        import asyncio
+        task = track_mutation(authority, _admit_automation_media(authority, adapter, event, identity, replaces))
+        return await asyncio.shield(task)
+    return await _admit_automation(authority, adapter, event, identity, replaces)
+
+
+async def _admit_automation(authority, adapter, event, identity, replaces=None, *, payload_entry=None):
     """``replaces``: a queued automation row of the same session this input supersedes (a liveness
     tick carrying the output of the one still waiting). Its cancellation commits in this admission's
     own transaction, so neither lands without the other."""
     authority._require_admission_open()
-    payload, entry = snapshot_automation(authority, adapter, event, identity)
+    payload, entry = payload_entry or snapshot_automation(authority, adapter, event, identity)
     from gateway.session_authority import LiveSession
     sid = (payload.get('local_automation_v1') or payload['native_text_v1']['automation'])['owner']
     ref = SessionRef(authority.profile_id, sid)
@@ -523,9 +596,8 @@ async def admit_automation(authority, adapter, event, identity, replaces=None):
                 authority._settle_cancelled(ref, replaces)
             return admitted(row)
     return await tracked_write(authority, partial(
-        admit_session_input, authority.db, epoch=authority.epoch, principal_id='automation:' + entry.session_key,
-        session_id=ref.session_id, request_id=identity, payload=deepcopy(payload),
-        _authorize_write=authority._admission_gate(replaces and _replace_queued(replaces, ref.session_id, replaced))),
+        _write_automation, authority, entry, ref, identity, deepcopy(payload),
+        authority._admission_gate(replaces and _replace_queued(replaces, ref.session_id, replaced))),
         then=admitted, ordered=True, after=partial(authority._schedule_admitted, ref))
 
 
