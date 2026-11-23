@@ -1,5 +1,7 @@
 """Shared-thread automation must retain bytes through the actual authority."""
 import json
+import asyncio
+import threading
 from pathlib import Path
 
 import pytest
@@ -62,3 +64,54 @@ async def test_shared_media_is_captured_and_exact_retry_is_idempotent(tmp_path, 
     (staging / 'link').symlink_to(outside)
     with pytest.raises(RuntimeStoreError, match='invalid_params'):
         await authority.admit_automation(adapter, event, identity)
+
+    # Reset wins when it publishes before the writer takes the route lock.
+    import gateway.session_automation as automation
+    photo.write_bytes(b'\x89PNG\r\n\x1a\nimage-bytes')
+    event.media_urls = [str(photo)]
+    event.media_types = ['image/png']
+    started, release = threading.Event(), threading.Event()
+    original_write = automation._write_automation
+    def paused_write(*args, **kwargs):
+        started.set()
+        assert release.wait(10)
+        return original_write(*args, **kwargs)
+    monkeypatch.setattr(automation, '_write_automation', paused_write)
+    race_identity = json.dumps(['piper-shared-thread', 'second-brain-web', 'web-race0001'], separators=(',', ':'))
+    task = asyncio.create_task(authority.admit_automation(adapter, event, race_identity))
+    assert await asyncio.to_thread(started.wait, 10)
+    fresh = await asyncio.to_thread(runner.session_store.reset_session, route)
+    assert fresh is not None
+    release.set()
+    with pytest.raises(RuntimeStoreError, match='admission_conflict'):
+        await task
+    assert not any(r['request_id'] == race_identity for r in list_session_admissions(
+        authority.db, session_id=human.ref.session_id, pending_only=False))
+
+    # Admission wins when its commit holds the route lock before reset starts.
+    monkeypatch.setattr(automation, '_write_automation', original_write)
+    started, release = threading.Event(), threading.Event()
+    original_admit = automation.admit_session_input
+    def paused_admit(*args, **kwargs):
+        started.set()
+        assert release.wait(10)
+        return original_admit(*args, **kwargs)
+    monkeypatch.setattr(automation, 'admit_session_input', paused_admit)
+    event.metadata['gateway_session_id'] = fresh.session_id
+    race_identity2 = json.dumps(['piper-shared-thread', 'second-brain-web', 'web-race0002'], separators=(',', ':'))
+    task = asyncio.create_task(authority.admit_automation(adapter, event, race_identity2))
+    assert await asyncio.to_thread(started.wait, 10)
+    reset_started = threading.Event()
+    def reset():
+        reset_started.set()
+        return runner.session_store.reset_session(route)
+    resetting = asyncio.create_task(asyncio.to_thread(reset))
+    assert await asyncio.to_thread(reset_started.wait, 10)
+    await asyncio.sleep(.1)
+    assert not resetting.done()
+    release.set()
+    receipt2 = await task
+    newest = await resetting
+    assert newest is not None
+    assert newest.session_id != fresh.session_id
+    assert receipt2.ref.session_id == fresh.session_id

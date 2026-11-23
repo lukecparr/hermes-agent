@@ -16,6 +16,9 @@ from hermes_state_runtime import RuntimeStoreError, admit_session_input, list_se
 
 logger = logging.getLogger(__name__)
 
+# The shared-thread plugin uses this explicit contract to gate browser uploads.
+SHARED_THREAD_MEDIA_V1 = True
+
 
 def producer_identity(runner, event):
     identity = runner._completion_delivery_identity(event)
@@ -560,8 +563,20 @@ def _write_automation(authority, entry, ref, identity, payload, authorize):
     from gateway.session_ingress_media import reconcile_native_retry
     principal = 'automation:' + entry.session_key
     if payload.get('native_text_v1', {}).get('media'):
-        payload = reconcile_native_retry(authority.db, principal_id=principal, session_id=ref.session_id,
-                                         request_id=identity, payload=payload)
+        # SessionStore publishes /new and other route rotations under this same
+        # lock. Hold it through the SQLite commit, in the store->DB lock order
+        # also used by routing persistence. A reset wins before the check or
+        # starts only after the admission commits; it cannot slip between them.
+        store = authority.runner.session_store
+        with store._lock:
+            current = store._entry_locked(entry.session_key)
+            if current is None or current.suspended or current.session_id != entry.session_id:
+                raise RuntimeStoreError('admission_conflict')
+            payload = reconcile_native_retry(authority.db, principal_id=principal, session_id=ref.session_id,
+                                             request_id=identity, payload=payload)
+            return admit_session_input(authority.db, epoch=authority.epoch, principal_id=principal,
+                                       session_id=ref.session_id, request_id=identity, payload=payload,
+                                       _authorize_write=authorize)
     return admit_session_input(authority.db, epoch=authority.epoch, principal_id=principal,
                                session_id=ref.session_id, request_id=identity, payload=payload,
                                _authorize_write=authorize)
