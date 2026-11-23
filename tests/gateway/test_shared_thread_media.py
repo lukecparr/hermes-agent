@@ -2,9 +2,36 @@
 import json
 import asyncio
 import threading
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+
+
+def test_sigkill_after_capture_exposes_unowned_retention_gap(tmp_path, monkeypatch):
+    """Real SIGKILL after native publish, before any admission exists.
+
+    This intentionally documents the blocker rather than treating orphan
+    retention as a successful cleanup. The public capability stays disabled.
+    """
+    from gateway.session_ingress_media import native_inputs_root, sweep_settled_media
+    from hermes_state import SessionDB
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    source = tmp_path / 'proof.txt'
+    source.write_bytes(b'private-orphan-fixture')
+    env = dict(os.environ, HERMES_HOME=str(tmp_path))
+    code = ("import os,signal,sys; "
+            "from gateway.session_ingress_media import capture_native_media; "
+            "capture_native_media([sys.argv[1]]); os.kill(os.getpid(), signal.SIGKILL)")
+    proc = subprocess.run([sys.executable, '-c', code, str(source)], env=env, check=False)
+    assert proc.returncode == -9
+    retained = list(native_inputs_root().glob('*/proof.txt'))
+    assert len(retained) == 1 and retained[0].read_bytes() == b'private-orphan-fixture'
+    db = SessionDB(db_path=tmp_path / 'state.db')
+    assert sweep_settled_media(db, now=10**12) == 0
+    assert retained[0].exists(), 'no terminal row exists for the current sweep to discover'
 
 
 @pytest.mark.asyncio
@@ -40,6 +67,10 @@ async def test_shared_media_is_captured_and_exact_retry_is_idempotent(tmp_path, 
     event = MessageEvent(text='look', source=source, internal=True, media_urls=[str(photo)],
                          media_types=['image/png'], metadata={'gateway_session_key': route,
                          'gateway_session_id': human.ref.session_id})
+    import gateway.session_automation as automation
+    with pytest.raises(RuntimeStoreError, match='invalid_params'):
+        await authority.admit_automation(adapter, event, identity)
+    monkeypatch.setattr(automation, 'SHARED_THREAD_MEDIA_V1', True)
     receipt = await authority.admit_automation(adapter, event, identity)
     rows = list_session_admissions(authority.db, session_id=human.ref.session_id, pending_only=False)
     row = next(row for row in rows if row['request_id'] == identity)

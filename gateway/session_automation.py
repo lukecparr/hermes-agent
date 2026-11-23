@@ -17,7 +17,7 @@ from hermes_state_runtime import RuntimeStoreError, admit_session_input, list_se
 logger = logging.getLogger(__name__)
 
 # The shared-thread plugin uses this explicit contract to gate browser uploads.
-SHARED_THREAD_MEDIA_V1 = True
+SHARED_THREAD_MEDIA_V1 = False  # fail closed until orphan recovery is verified
 
 
 def producer_identity(runner, event):
@@ -584,6 +584,8 @@ def _write_automation(authority, entry, ref, identity, payload, authorize):
 
 async def admit_automation(authority, adapter, event, identity, replaces=None):
     if event.media_urls:
+        if not SHARED_THREAD_MEDIA_V1:
+            raise RuntimeStoreError('invalid_params')
         from gateway.session_runtime_workers import track_mutation
         # Keep the lease and write alive even if the HTTP caller disconnects.
         import asyncio
