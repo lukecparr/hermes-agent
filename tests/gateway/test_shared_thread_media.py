@@ -115,3 +115,33 @@ async def test_shared_media_is_captured_and_exact_retry_is_idempotent(tmp_path, 
     assert newest is not None
     assert newest.session_id != fresh.session_id
     assert receipt2.ref.session_id == fresh.session_id
+
+    # Caller cancellation while the capture runs must not orphan or lose a
+    # later committed input: the shielded tracked mutation finishes ownership.
+    monkeypatch.setattr(automation, 'admit_session_input', original_admit)
+    import gateway.session_ingress_media as media
+    original_capture = media.capture_native_media
+    entered, release_capture = threading.Event(), threading.Event()
+    def paused_capture(paths):
+        entered.set()
+        assert release_capture.wait(10)
+        return original_capture(paths)
+    monkeypatch.setattr(media, 'capture_native_media', paused_capture)
+    event.metadata['gateway_session_id'] = newest.session_id
+    cancelled_id = json.dumps(['piper-shared-thread', 'second-brain-web', 'web-cancel001'], separators=(',', ':'))
+    cancelled = asyncio.create_task(authority.admit_automation(adapter, event, cancelled_id))
+    assert await asyncio.to_thread(entered.wait, 10)
+    cancelled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled
+    release_capture.set()
+    found = None
+    for _ in range(200):
+        rows = list_session_admissions(authority.db, session_id=newest.session_id, pending_only=False)
+        found = next((row for row in rows if row['request_id'] == cancelled_id), None)
+        if found:
+            break
+        await asyncio.sleep(.05)
+    assert found is not None
+    committed_file = Path(found['payload']['native_text_v1']['media'][0]['path'])
+    assert committed_file.read_bytes() == photo.read_bytes()
