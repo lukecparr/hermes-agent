@@ -271,7 +271,7 @@ def _open_regular(path):
     return os.fdopen(fd, 'rb')
 
 
-def capture_native_media(paths):
+def capture_native_media(paths, *, before_publish=None):
     from gateway.platforms.base import get_inbound_media_max_bytes, validate_inbound_media_size
     references = []
     limit = max(0, get_inbound_media_max_bytes())
@@ -285,6 +285,8 @@ def capture_native_media(paths):
         for value in paths:
             _capture_file(Path(value), limit, total, references, staged)
             total = sum(reference['size'] for reference in references)
+        if before_publish is not None:
+            before_publish(references, staged)
         for temporary, reference in zip(staged, references):
             target = Path(reference['path'])
             root = target.parent.parent

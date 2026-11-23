@@ -539,9 +539,11 @@ async def _admit_automation_media(authority, adapter, event, identity, replaces)
     if any(not p.is_absolute() or p.parent.parent != root or p.resolve() != p for p in paths):
         raise RuntimeStoreError('invalid_params')
     payload, entry = snapshot_automation(authority, adapter, event, identity)
+    from gateway.session_shared_media_intent import CaptureIntent
+    intent = await asyncio.to_thread(CaptureIntent().acquire)
     with capture_lease(authority) as scope:
         try:
-            references = await asyncio.to_thread(capture_native_media, paths)
+            references = await asyncio.to_thread(capture_native_media, paths, before_publish=intent.record)
             if sum(ref['size'] for ref in references) > 5 * 1024 * 1024:
                 raise RuntimeStoreError('invalid_params')
             # A reset or connector change while bytes were being captured must
@@ -557,6 +559,8 @@ async def _admit_automation_media(authority, adapter, event, identity, replaces)
         except BaseException:
             await abandon_capture(scope)
             raise
+        finally:
+            intent.release()
 
 
 def _write_automation(authority, entry, ref, identity, payload, authorize):

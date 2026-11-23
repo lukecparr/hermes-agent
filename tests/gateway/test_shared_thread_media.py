@@ -5,9 +5,49 @@ import threading
 import os
 import subprocess
 import sys
+import signal
 from pathlib import Path
 
 import pytest
+
+
+def test_intent_lock_survives_cross_process_contention_and_releases_on_kill(tmp_path, monkeypatch):
+    import fcntl
+    from gateway.session_shared_media_intent import CaptureIntent, inspect_intents
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    code = ("import time; from gateway.session_shared_media_intent import CaptureIntent; "
+            "i=CaptureIntent().acquire(); print('locked',flush=True); time.sleep(30)")
+    proc = subprocess.Popen([sys.executable, '-c', code], env=dict(os.environ), stdout=subprocess.PIPE, text=True)
+    try:
+        assert proc.stdout is not None
+        assert proc.stdout.readline().strip() == 'locked'
+        contender = os.open(CaptureIntent().root / '.lock', os.O_RDWR | os.O_NOFOLLOW)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(contender)
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
+    assert proc.returncode == -signal.SIGKILL
+    assert inspect_intents() == []
+
+
+def test_malformed_intent_fails_closed_without_touching_media(tmp_path, monkeypatch):
+    from gateway.session_shared_media_intent import CaptureIntent, inspect_intents
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    intent = CaptureIntent().acquire()
+    intent.record([{'path': str(tmp_path / 'data'), 'sha256': 'test', 'size': 4}], [])
+    record = intent.path
+    assert record is not None
+    intent.release()
+    data = tmp_path / 'data'
+    data.write_bytes(b'keep')
+    record.write_text('{broken')
+    with pytest.raises(json.JSONDecodeError):
+        inspect_intents()
+    assert data.read_bytes() == b'keep' and record.exists()
 
 
 def test_sigkill_after_capture_exposes_unowned_retention_gap(tmp_path, monkeypatch):
@@ -17,6 +57,7 @@ def test_sigkill_after_capture_exposes_unowned_retention_gap(tmp_path, monkeypat
     retention as a successful cleanup. The public capability stays disabled.
     """
     from gateway.session_ingress_media import native_inputs_root, sweep_settled_media
+    from gateway.session_shared_media_intent import inspect_intents
     from hermes_state import SessionDB
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     source = tmp_path / 'proof.txt'
@@ -24,11 +65,16 @@ def test_sigkill_after_capture_exposes_unowned_retention_gap(tmp_path, monkeypat
     env = dict(os.environ, HERMES_HOME=str(tmp_path))
     code = ("import os,signal,sys; "
             "from gateway.session_ingress_media import capture_native_media; "
-            "capture_native_media([sys.argv[1]]); os.kill(os.getpid(), signal.SIGKILL)")
+            "from gateway.session_shared_media_intent import CaptureIntent; "
+            "i=CaptureIntent().acquire(); "
+            "capture_native_media([sys.argv[1]],before_publish=i.record); "
+            "os.kill(os.getpid(), signal.SIGKILL)")
     proc = subprocess.run([sys.executable, '-c', code, str(source)], env=env, check=False)
     assert proc.returncode == -9
     retained = list(native_inputs_root().glob('*/proof.txt'))
     assert len(retained) == 1 and retained[0].read_bytes() == b'private-orphan-fixture'
+    records = inspect_intents()
+    assert len(records) == 1 and records[0]['references'][0]['path'] == str(retained[0])
     db = SessionDB(db_path=tmp_path / 'state.db')
     assert sweep_settled_media(db, now=10**12) == 0
     assert retained[0].exists(), 'no terminal row exists for the current sweep to discover'
@@ -153,10 +199,10 @@ async def test_shared_media_is_captured_and_exact_retry_is_idempotent(tmp_path, 
     import gateway.session_ingress_media as media
     original_capture = media.capture_native_media
     entered, release_capture = threading.Event(), threading.Event()
-    def paused_capture(paths):
+    def paused_capture(paths, **kwargs):
         entered.set()
         assert release_capture.wait(10)
-        return original_capture(paths)
+        return original_capture(paths, **kwargs)
     monkeypatch.setattr(media, 'capture_native_media', paused_capture)
     event.metadata['gateway_session_id'] = newest.session_id
     cancelled_id = json.dumps(['piper-shared-thread', 'second-brain-web', 'web-cancel001'], separators=(',', ':'))
