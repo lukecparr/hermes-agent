@@ -1,0 +1,9 @@
+# Piper attachment staging probe (draft, do not deploy)
+
+The media draft intentionally hardcodes `SHARED_THREAD_MEDIA_V1 = False`; there is no supported runtime configuration to turn it on. The production default remains false. Do not change it in a release or running gateway based on this experiment.
+
+For an isolated disposable test only, create a detached worktree from the exact reviewed draft head, and change **only that disposable worktree's** `gateway/session_automation.py` declaration to `SHARED_THREAD_MEDIA_V1 = True`. Start the gateway in a fresh empty scratch `HERMES_HOME`, with synthetic credentials, an isolated fake relay and a loopback mock model. Never copy the staged file into the draft or production. Use a separately authenticated synthetic SB request and a synthetic attachment. Run every server and test process in the foreground and close them on exit.
+
+A foreground probe against Hermes `ee89715806`, shared-thread plugin `55fdd4a`, and SB `5b900e3` passed the actual SB turn handler -> loopback HTTP -> shared-thread plugin -> gateway authority -> mock model. The fixture used a staging-only source edit as above (no runtime monkeypatch). SB returned 202 on admission and 200 on exact replay, the turn completed, and the exact synthetic bytes `hello` were present in the private media namespace and the document name reached the model request. The test called the real SB handler, not a complete deployed SB HTTP server. No phone, Firebase or external provider was involved.
+
+This shows the normal file path with that exact staging modification. It does not establish that the feature is safe to enable: the legacy shared-cache orphan remains outside the private namespace; payload-bearing stages with unreadable manifests are retained; longer-term retention, production upgrade/recovery and the combined notifications/attachments branch still need review. Keep the feature off until those decisions and a separate production approval.
