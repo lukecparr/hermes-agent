@@ -832,14 +832,14 @@ class SessionAuthority:
         live_route = self.sessions[ref.session_id].route
         answer = (captured or {}).get('result') or {}
         callbacks = (await asyncio.to_thread(required_extensions, self.db, self.profile_id)
-                     if prepared is not None and before['owner_epoch'] == self.epoch else ())
+                     if before is not None and before['status'] == 'unknown' else ())
         def terminal_write(conn, lost):
             same_owner = prepared is not None and lost['owner_epoch'] == self.epoch
             close_discarded_turn(self.db, conn, lost, None if same_owner else notice)
-            if same_owner:
-                write_extensions(self.db, callbacks, conn, row=before, route=live_route,
-                                 response=answer.get('final_response') or '', outcome=prepared[0], result=captured,
-                                 profile_id=self.profile_id)
+            write_extensions(self.db, callbacks, conn, row=before, route=live_route,
+                             response=(answer.get('final_response') or '') if same_owner else '',
+                             outcome=prepared[0] if same_owner else 'interrupted',
+                             result=captured if same_owner else None, profile_id=self.profile_id)
         from gateway.session_runtime_workers import tracked_write
         return await tracked_write(self, partial(
             resolve_unknown_session_input, self.db, epoch=self.epoch, admission_id=admission_id,
@@ -1402,7 +1402,7 @@ async def initialize_session_authority(runner, *, profile_id, instance_id, db=No
     await asyncio.to_thread(recover_session_inputs, db, epoch=epoch)
     # A lost automation turn has nobody to resolve it: it settles interrupted before any FIFO runs.
     from gateway.session_unattended_unknown import settle_recovered_unattended
-    await asyncio.to_thread(settle_recovered_unattended, db, epoch)
+    await asyncio.to_thread(settle_recovered_unattended, db, epoch, profile_id=profile_id)
     await asyncio.to_thread(backfill_legacy_session_owners, db)
     await asyncio.to_thread(backfill_compression_created_sources, db)
     authority = SessionAuthority(runner, profile_id=profile_id, instance_id=instance_id, db=db, epoch=epoch)

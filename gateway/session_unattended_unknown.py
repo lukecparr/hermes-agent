@@ -38,7 +38,7 @@ def _unattended_unknown(rows):
     return [row for row in rows if row['status'] == 'unknown' and is_unattended(row)]
 
 
-def settle_recovered_unattended(db, epoch) -> int:
+def settle_recovered_unattended(db, epoch, *, profile_id=None) -> int:
     """Boot recovery, right after ``recover_session_inputs`` fenced lost turns ``unknown`` and before
     any FIFO is scheduled: settle every unattended one. Synchronous; runs off the owner loop."""
     from agent.turn_failure_copy import AUTOMATION_INTERRUPTED_NOTICE
@@ -48,12 +48,21 @@ def settle_recovered_unattended(db, epoch) -> int:
     with db._read_ctx() as conn:
         rows = [_row(r) for r in conn.execute(
             "SELECT * FROM session_admissions WHERE status='unknown' ORDER BY seq").fetchall()]
+    from gateway.session_settlement_extensions import required_extensions, write_extensions
+    pending = _unattended_unknown(rows)
+    callbacks = required_extensions(db, profile_id) if pending else ()
     settled = 0
-    for row in _unattended_unknown(rows):
+    for row in pending:
+        principal = row.get('principal_id') or ''
+        route = principal[len('automation:'):] if principal.startswith('automation:') else None
+        def terminal_write(conn, lost):
+            close_discarded_turn(db, conn, lost, AUTOMATION_INTERRUPTED_NOTICE)
+            write_extensions(db, callbacks, conn, row=row, route=route, response='', outcome='interrupted',
+                             result=None, profile_id=profile_id)
         try:
             resolve_unknown_session_input(
                 db, epoch=epoch, admission_id=row['admission_id'], generation=row['generation'],
-                _terminal_write=lambda conn, lost: close_discarded_turn(db, conn, lost, AUTOMATION_INTERRUPTED_NOTICE))
+                _terminal_write=terminal_write)
         except RuntimeStoreError as exc:
             logger.warning('Lost automation admission %s left unknown: %s', row['admission_id'], exc.reason)
             continue

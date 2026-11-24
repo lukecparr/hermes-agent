@@ -133,6 +133,54 @@ async def test_startup_missing_plugin_does_not_fence_existing_owner(owner, tmp_p
     assert settled['outcome'] == 'failed'
 
 
+@pytest.mark.asyncio
+async def test_discard_unknown_invokes_required_writer_with_interrupted_outcome(owner, tmp_path, monkeypatch):
+    from gateway.session_authority import LiveSession
+    from gateway.session_contract import Principal, SessionRef
+    setup_config(tmp_path)
+    (tmp_path / 'plugins' / 'piper-turn-outbox' / '__init__.py').write_text(
+        'def register(ctx):\n'
+        '    def write(*, conn, row, route, outcome, result, **kw):\n'
+        '        conn.execute("CREATE TABLE audit (admission TEXT, route TEXT, outcome TEXT)")\n'
+        '        conn.execute("INSERT INTO audit VALUES (?, ?, ?)", (row["admission_id"], route, outcome))\n'
+        '        assert result is None\n'
+        '    ctx.register_settlement_extension(write)\n')
+    row = claim(owner)
+    owner.sessions[TURN] = LiveSession(None, ROUTE)
+    owner.db._execute_write(lambda conn: conn.execute(
+        "UPDATE session_admissions SET status='unknown' WHERE admission_id=?", (row['admission_id'],)))
+    async def resolved(_ref, _id, _prepared, _captured, result):
+        return result
+    monkeypatch.setattr(owner, '_resolved_unknown', resolved)
+    actor = Principal('human', owner.profile_id, frozenset({'session:control', 'session:submit'}), 'test')
+    settled = await owner.resolve_unknown(actor, SessionRef(owner.profile_id, TURN), row['admission_id'], row['generation'])
+    assert settled['outcome'] == 'interrupted'
+    with owner.db._read_ctx() as conn:
+        assert tuple(conn.execute('SELECT * FROM audit').fetchone()) == (row['admission_id'], ROUTE, 'interrupted')
+
+
+def test_boot_interruption_writer_failure_rolls_back(owner, tmp_path):
+    from gateway.session_unattended_unknown import settle_recovered_unattended
+    from hermes_state_runtime import begin_runtime_epoch, recover_session_inputs
+    setup_config(tmp_path)
+    (tmp_path / 'plugins' / 'piper-turn-outbox' / '__init__.py').write_text(
+        'def register(ctx):\n'
+        '    def write(*, conn, outcome, route, **kw):\n'
+        '        assert outcome == "interrupted"\n'
+        f'        assert route == "{ROUTE}"\n'
+        '        conn.execute("CREATE TABLE audit (id TEXT)")\n'
+        '        raise RuntimeError("audit failed")\n'
+        '    ctx.register_settlement_extension(write)\n')
+    row = claim(owner)
+    epoch = begin_runtime_epoch(owner.db, instance_id='restarted')
+    recover_session_inputs(owner.db, epoch=epoch)
+    with pytest.raises(RuntimeError, match='audit failed'):
+        settle_recovered_unattended(owner.db, epoch, profile_id=str(tmp_path))
+    assert get_session_admission(owner.db, admission_id=row['admission_id'])['status'] == 'unknown'
+    with owner.db._read_ctx() as conn:
+        assert conn.execute("SELECT 1 FROM sqlite_master WHERE name='audit'").fetchone() is None
+
+
 def test_restart_loses_uncommitted_capture_and_does_not_invent_completion(owner, tmp_path):
     from gateway.session_unattended_unknown import settle_recovered_unattended
     from hermes_state_runtime import begin_runtime_epoch, recover_session_inputs
