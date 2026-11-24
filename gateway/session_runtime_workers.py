@@ -74,7 +74,7 @@ def track_mutation(authority, operation):
     return task
 
 
-async def tracked_write(authority, write, then=None, *, ordered=False, after=None):
+async def tracked_write(authority, write, then=None, *, ordered=False, after=None, physical_fence=None):
     """Run a synchronous ledger write (``write()``) in a worker thread, off the owner loop.
 
     A held SQLite writer (``_WRITE_PATIENCE_S``) must not freeze every session, timer, socket,
@@ -93,17 +93,55 @@ async def tracked_write(authority, write, then=None, *, ordered=False, after=Non
     if ordered and order is None:
         order = authority._ordered_writes = asyncio.Lock()
 
+    async def execute():
+        if physical_fence is None:
+            return await asyncio.to_thread(write)
+        # The asyncio waiter may be cancelled while its executor thread still
+        # runs. The worker, not the waiter, owns this reference until it exits.
+        import threading
+        physical_fence.retain()
+        gate = threading.Lock()
+        state = {'started': False, 'abandoned': False}
+        def physically_owned_write():
+            with gate:
+                if state['abandoned']:
+                    return None
+                state['started'] = True
+            try:
+                return write()
+            finally:
+                physical_fence.release()
+        try:
+            return await asyncio.to_thread(physically_owned_write)
+        except BaseException:
+            with gate:
+                if not state['started']:
+                    # Executor work cancelled before it starts must not leak
+                    # the fence; if it starts later it will observe abandoned.
+                    state['abandoned'] = True
+                    physical_fence.release()
+            raise
+
     async def run():
         if ordered:
             async with order:
-                result = await asyncio.to_thread(write)
+                result = await execute()
         else:
-            result = await asyncio.to_thread(write)
+            result = await execute()
         if then is None:
             return result
         followed = then(result)
         return await followed if asyncio.iscoroutine(followed) else followed
-    task = track_mutation(authority, run())
+    if physical_fence is not None:
+        physical_fence.retain()  # also covers an ordered write waiting to start
+    try:
+        task = track_mutation(authority, run())
+    except BaseException:
+        if physical_fence is not None:
+            physical_fence.release()
+        raise
+    if physical_fence is not None:
+        task.add_done_callback(lambda _done: physical_fence.release())
     if after is None:
         return await asyncio.shield(task)
     try:
