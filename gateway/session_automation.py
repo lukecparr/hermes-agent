@@ -590,7 +590,17 @@ async def admit_automation(authority, adapter, event, identity, replaces=None):
         from gateway.session_runtime_workers import track_mutation
         # Keep the lease and write alive even if the HTTP caller disconnects.
         import asyncio
-        task = track_mutation(authority, _admit_automation_media(authority, adapter, event, identity, replaces))
+        fence = getattr(event, '_piper_stage_fence', None)
+        if fence is not None:
+            fence.retain()
+        try:
+            task = track_mutation(authority, _admit_automation_media(authority, adapter, event, identity, replaces))
+        except BaseException:
+            if fence is not None:
+                fence.release()
+            raise
+        if fence is not None:
+            task.add_done_callback(lambda _done: fence.release())
         return await asyncio.shield(task)
     return await _admit_automation(authority, adapter, event, identity, replaces)
 
@@ -618,8 +628,10 @@ async def _admit_automation(authority, adapter, event, identity, replaces=None, 
     write = (partial(_write_automation_private, authority, adapter, event, entry, ref, identity,
                      deepcopy(payload), authorize, media_paths, media_types) if media_paths is not None else
              partial(_write_automation, authority, entry, ref, identity, deepcopy(payload), authorize))
+    options = ({'physical_fence': getattr(event, '_piper_stage_fence', None)}
+               if media_paths is not None else {})
     return await tracked_write(authority, write,
-        then=admitted, ordered=True, after=partial(authority._schedule_admitted, ref))
+        then=admitted, ordered=True, after=partial(authority._schedule_admitted, ref), **options)
 
 
 _ROUTE_WAKE_PRODUCERS = frozenset({'kanban-wake', 'loop-tick'})

@@ -76,6 +76,121 @@ asyncio.run(run())
             assert Path(ref['path']).read_bytes() == b'gateway crash fixture'
 
 
+@pytest.mark.asyncio
+async def test_cancelled_tracked_writer_holds_fence_until_thread_exits(tmp_path):
+    import fcntl
+    from types import SimpleNamespace
+    from gateway.session_runtime_workers import tracked_write
+    lock = tmp_path / 'staging.lock'
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    class Fence:
+        def __init__(self):
+            self.n, self.lock = 1, threading.Lock()
+        def retain(self):
+            with self.lock:
+                self.n += 1
+        def release(self):
+            with self.lock:
+                self.n -= 1
+                if not self.n:
+                    os.close(fd)
+    fence = Fence()
+    entered, unblock = threading.Event(), threading.Event()
+    authority = SimpleNamespace()
+    def write():
+        entered.set()
+        assert unblock.wait(10)
+        return 'done'
+    caller = asyncio.create_task(tracked_write(authority, write, ordered=True, physical_fence=fence))
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        for task in list(authority._mutation_tasks):
+            task.cancel()
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        fence.release()  # the cancelled plugin caller has given up its own reference
+        await asyncio.sleep(.05)
+        code = ("import fcntl,os,sys; f=os.open(sys.argv[1],os.O_RDWR); "
+                "fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)")
+        busy = await asyncio.to_thread(subprocess.run, [sys.executable, '-c', code, str(lock)],
+                                       capture_output=True, check=False)
+        assert busy.returncode != 0
+        unblock.set()
+        for _ in range(100):
+            await asyncio.sleep(.02)
+            check = await asyncio.to_thread(subprocess.run, [sys.executable, '-c', code, str(lock)],
+                                            capture_output=True, check=False)
+            if check.returncode == 0:
+                break
+        else:
+            pytest.fail('worker finished but staging fence remained locked')
+    finally:
+        unblock.set()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_queued_executor_write_releases_fence_without_running(tmp_path):
+    import fcntl
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+    from gateway.session_runtime_workers import tracked_write
+    loop = asyncio.get_running_loop()
+    executor = ThreadPoolExecutor(max_workers=1)
+    loop.set_default_executor(executor)
+    block, entered, wrote = threading.Event(), threading.Event(), threading.Event()
+    def occupy():
+        entered.set()
+        block.wait(10)
+    occupying = loop.run_in_executor(None, occupy)
+    while not entered.is_set():
+        await asyncio.sleep(.01)
+    path = tmp_path / 'queued-lock'
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    class Fence:
+        def __init__(self):
+            self.n = 1
+            self.lock = threading.Lock()
+        def retain(self):
+            with self.lock:
+                self.n += 1
+        def release(self):
+            with self.lock:
+                self.n -= 1
+                if self.n == 0:
+                    os.close(fd)
+    fence = Fence()
+    authority = SimpleNamespace()
+    caller = asyncio.create_task(tracked_write(authority, lambda: wrote.set(), ordered=True, physical_fence=fence))
+    try:
+        for _ in range(100):
+            await asyncio.sleep(.01)
+            if fence.n == 3:
+                break
+        assert fence.n == 3  # caller, ordered task, and queued executor job
+        for task in list(authority._mutation_tasks):
+            task.cancel()
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        fence.release()
+        await asyncio.sleep(.05)
+        contender = os.open(path, os.O_RDWR)
+        try:
+            fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(contender)
+        block.set()
+        await occupying
+        await asyncio.sleep(.05)
+        assert not wrote.is_set()
+    finally:
+        block.set()
+        executor.shutdown(wait=True)
+
+
 def test_intent_lock_survives_cross_process_contention_and_releases_on_kill(tmp_path, monkeypatch):
     import fcntl
     from gateway.session_shared_media_intent import CaptureIntent, inspect_intents
