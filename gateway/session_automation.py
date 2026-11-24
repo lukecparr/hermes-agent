@@ -7,6 +7,7 @@ from copy import deepcopy
 from datetime import UTC, datetime
 import json
 import logging
+import re
 
 from gateway.config import Platform
 from gateway.platforms.event import MessageEvent, MessageType
@@ -14,6 +15,9 @@ from gateway.session_contract import SessionRef
 from hermes_state_runtime import RuntimeStoreError, admit_session_input, list_session_admissions
 
 logger = logging.getLogger(__name__)
+
+# The shared-thread plugin uses this explicit contract to gate browser uploads.
+SHARED_THREAD_MEDIA_V1 = False  # fail closed until orphan recovery is verified
 
 
 def producer_identity(runner, event):
@@ -388,13 +392,16 @@ def snapshot_automation(authority, adapter, event, identity):
     runner = authority.runner
     if (not event.internal or event.message_type != MessageType.TEXT or event.is_command()
             or not isinstance(event.text, str) or not identity
-            or event.media_urls or event.prompt_response or event.source.platform == Platform.API_SERVER
+            or (event.media_urls and not _shared_thread_media_identity(identity))
+            or event.prompt_response or event.source.platform == Platform.API_SERVER
             or set(event.metadata) - _AUTOMATION_METADATA):
         raise RuntimeStoreError('invalid_params')
     notification = (automation_notification_metadata(event.metadata) | automation_display_metadata(event.metadata)
                     | _tick_metadata(event.metadata))
     entry = _owner(runner, event, authority)
     if event.source.platform == Platform.LOCAL:
+        if event.media_urls:
+            raise RuntimeStoreError('invalid_params')
         return snapshot_local_automation(authority, adapter, event, identity, entry)
     from gateway.session_envelope import restore_native
     owner = authority.logical_owner(entry.session_id)
@@ -504,12 +511,107 @@ def restore_local_automation(authority, ref, row):
     return event
 
 
+def _shared_thread_media_identity(identity):
+    try:
+        value = json.loads(identity)
+    except (TypeError, ValueError):
+        return False
+    return (isinstance(value, list) and len(value) == 3 and value[0] == 'piper-shared-thread'
+            and isinstance(value[1], str) and re.fullmatch(r'[a-z0-9][a-z0-9-]{1,31}', value[1]) is not None
+            and isinstance(value[2], str) and re.fullmatch(r'[A-Za-z0-9_-]{8,64}', value[2]) is not None)
+
+
+async def _admit_automation_media(authority, adapter, event, identity, replaces):
+    from pathlib import Path
+    from hermes_constants import get_hermes_home
+    if (not _shared_thread_media_identity(identity) or replaces is not None
+            or not isinstance(event.media_urls, list) or not 1 <= len(event.media_urls) <= 3
+            or not isinstance(event.media_types, list) or len(event.media_types) != len(event.media_urls)
+            or any(m not in {'image/png', 'image/jpeg', 'image/gif', 'image/webp',
+                             'application/pdf', 'text/plain'} for m in event.media_types)):
+        raise RuntimeStoreError('invalid_params')
+    root = get_hermes_home().resolve() / 'piper-shared-thread' / 'attachments'
+    if root.resolve() != root:
+        raise RuntimeStoreError('invalid_params')
+    paths = [Path(path) for path in event.media_urls]
+    if any(not p.is_absolute() or p.parent.parent != root or p.resolve() != p for p in paths):
+        raise RuntimeStoreError('invalid_params')
+    payload, entry = snapshot_automation(authority, adapter, event, identity)
+    return await _admit_automation(authority, adapter, event, identity, replaces,
+                                   payload_entry=(payload, entry), media_paths=paths,
+                                   media_types=tuple(event.media_types))
+
+
+def _write_automation_private(authority, adapter, event, entry, ref, identity, payload, authorize, paths, media_types):
+    """Capture and commit in one ordered worker, fenced against other processes' collectors."""
+    from gateway.session_shared_media_private import private_store, capture_private_batch, recover_private
+    from agent.provider_media import MEDIA_CACHE_MAX_AGE_HOURS
+    import time
+    with private_store() as root:
+        recover_private(root, authority.db, older_than=time.time() - MEDIA_CACHE_MAX_AGE_HOURS * 3600)
+        references = capture_private_batch(root, paths)
+        again, current = snapshot_automation(authority, adapter, event, identity)
+        if (current.session_id != entry.session_id or again != payload
+                or tuple(event.media_urls) != tuple(map(str, paths)) or tuple(event.media_types) != media_types):
+            raise RuntimeStoreError('admission_conflict')
+        payload['native_text_v1']['media'] = references
+        payload['native_text_v1']['event']['media_types'] = list(media_types)
+        payload['native_text_v1']['event']['media_text_inlined'] = [False] * len(references)
+        return _write_automation(authority, entry, ref, identity, payload, authorize)
+
+
+def _write_automation(authority, entry, ref, identity, payload, authorize):
+    from gateway.session_ingress_media import reconcile_native_retry
+    principal = 'automation:' + entry.session_key
+    if payload.get('native_text_v1', {}).get('media'):
+        # SessionStore publishes /new and other route rotations under this same
+        # lock. Hold it through the SQLite commit, in the store->DB lock order
+        # also used by routing persistence. A reset wins before the check or
+        # starts only after the admission commits; it cannot slip between them.
+        store = authority.runner.session_store
+        with store._lock:
+            current = store._entry_locked(entry.session_key)
+            if current is None or current.suspended or current.session_id != entry.session_id:
+                raise RuntimeStoreError('admission_conflict')
+            payload = reconcile_native_retry(authority.db, principal_id=principal, session_id=ref.session_id,
+                                             request_id=identity, payload=payload)
+            return admit_session_input(authority.db, epoch=authority.epoch, principal_id=principal,
+                                       session_id=ref.session_id, request_id=identity, payload=payload,
+                                       _authorize_write=authorize)
+    return admit_session_input(authority.db, epoch=authority.epoch, principal_id=principal,
+                               session_id=ref.session_id, request_id=identity, payload=payload,
+                               _authorize_write=authorize)
+
+
 async def admit_automation(authority, adapter, event, identity, replaces=None):
+    if event.media_urls:
+        if not SHARED_THREAD_MEDIA_V1:
+            raise RuntimeStoreError('invalid_params')
+        from gateway.session_runtime_workers import track_mutation
+        # Keep the lease and write alive even if the HTTP caller disconnects.
+        import asyncio
+        fence = getattr(event, '_piper_stage_fence', None)
+        if fence is not None:
+            fence.retain()
+        try:
+            task = track_mutation(authority, _admit_automation_media(authority, adapter, event, identity, replaces))
+        except BaseException:
+            if fence is not None:
+                fence.release()
+            raise
+        if fence is not None:
+            task.add_done_callback(lambda _done: fence.release())
+        return await asyncio.shield(task)
+    return await _admit_automation(authority, adapter, event, identity, replaces)
+
+
+async def _admit_automation(authority, adapter, event, identity, replaces=None, *, payload_entry=None,
+                            media_paths=None, media_types=None):
     """``replaces``: a queued automation row of the same session this input supersedes (a liveness
     tick carrying the output of the one still waiting). Its cancellation commits in this admission's
     own transaction, so neither lands without the other."""
     authority._require_admission_open()
-    payload, entry = snapshot_automation(authority, adapter, event, identity)
+    payload, entry = payload_entry or snapshot_automation(authority, adapter, event, identity)
     from gateway.session_authority import LiveSession
     sid = (payload.get('local_automation_v1') or payload['native_text_v1']['automation'])['owner']
     ref = SessionRef(authority.profile_id, sid)
@@ -522,11 +624,14 @@ async def admit_automation(authority, adapter, event, identity, replaces=None):
             if replaced:  # the guard ran in the committed write; an exact replay runs no guard
                 authority._settle_cancelled(ref, replaces)
             return admitted(row)
-    return await tracked_write(authority, partial(
-        admit_session_input, authority.db, epoch=authority.epoch, principal_id='automation:' + entry.session_key,
-        session_id=ref.session_id, request_id=identity, payload=deepcopy(payload),
-        _authorize_write=authority._admission_gate(replaces and _replace_queued(replaces, ref.session_id, replaced))),
-        then=admitted, ordered=True, after=partial(authority._schedule_admitted, ref))
+    authorize = authority._admission_gate(replaces and _replace_queued(replaces, ref.session_id, replaced))
+    write = (partial(_write_automation_private, authority, adapter, event, entry, ref, identity,
+                     deepcopy(payload), authorize, media_paths, media_types) if media_paths is not None else
+             partial(_write_automation, authority, entry, ref, identity, deepcopy(payload), authorize))
+    options = ({'physical_fence': getattr(event, '_piper_stage_fence', None)}
+               if media_paths is not None else {})
+    return await tracked_write(authority, write,
+        then=admitted, ordered=True, after=partial(authority._schedule_admitted, ref), **options)
 
 
 _ROUTE_WAKE_PRODUCERS = frozenset({'kanban-wake', 'loop-tick'})
