@@ -30,9 +30,9 @@ def isolate_stop_notice(monkeypatch):
     monkeypatch.setattr(extensions, 'required_extensions', callbacks)
 
 
-def claim(owner, *, turn=TURN, principal=None, producer='piper-shared-thread'):
+def claim(owner, *, turn=TURN, principal=None, producer='piper-shared-thread', surface='second-brain-web', request_id=None):
     owner.db.create_session(turn, source='telegram')
-    identity = json.dumps([producer, 'second-brain-web', turn], separators=(',', ':'))
+    identity = request_id or json.dumps([producer, surface, turn], separators=(',', ':'))
     admitted = admit_session_input(owner.db, epoch=owner.epoch, principal_id=principal or 'automation:' + ROUTE,
                                    session_id=turn, request_id=identity, payload={'text': 'private question'})
     row = claim_session_input(owner.db, epoch=owner.epoch, session_id=turn)
@@ -52,6 +52,27 @@ def events(owner):
         if not exists:
             return []
         return [tuple(r) for r in conn.execute('SELECT admission_id, turn_id, event_type FROM piper_turn_outbox')]
+
+
+@pytest.mark.parametrize('surface', ['telegram', 'charm'])
+def test_shared_route_nonweb_completion_is_one_private_event(owner, monkeypatch, surface):
+    monkeypatch.setenv('PIPER_TURN_OUTBOX_ROUTE', ROUTE)
+    principal = 'messaging:' + json.dumps(['default', 'telegram', 'test', None, 'test'], separators=(',', ':'))
+    row = claim(owner, turn='turn-charm-0001', surface='charm',
+                principal=principal if surface == 'telegram' else None,
+                request_id='telegram-message-1' if surface == 'telegram' else None)
+    finish(owner, row)
+    assert events(owner) == [(row['admission_id'], 'web-' + row['admission_id'], 'piper.turn.completed.v1')]
+    finish(owner, row)
+    assert len(events(owner)) == 1
+
+
+def test_other_messaging_platform_does_not_notify(owner, monkeypatch):
+    monkeypatch.setenv('PIPER_TURN_OUTBOX_ROUTE', ROUTE)
+    principal = 'messaging:' + json.dumps(['default', 'discord', 'test', None, 'test'])
+    row = claim(owner, principal=principal, request_id='message-1')
+    finish(owner, row)
+    assert events(owner) == []
 
 
 def test_completion_replay_and_private_payload(owner, monkeypatch):

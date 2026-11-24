@@ -7,6 +7,7 @@ sb_root=Path(os.environ['PIPER_TEST_SB_ROOT']).resolve()
 sys.path[:0]=[str(root),str(plugin/'tests')]
 from e2e_probe import Model, free_port, http, CHAT, KEY, PREFIX
 TOKEN='z'*40
+CHARM_TOKEN='c'*40
 
 async def main():
     base=Path(tempfile.mkdtemp(prefix='piper-web-e2e-',dir=os.environ['TMPDIR'])); home=base/'home'; home.mkdir(mode=0o700)
@@ -19,6 +20,7 @@ async def main():
     import importlib.util
     spec=importlib.util.spec_from_file_location('staging_plugin',plugin/'shared_thread.py'); pst=importlib.util.module_from_spec(spec); spec.loader.exec_module(pst)
     pst.TokenStore.add(home/'piper-shared-thread/tokens.json','second-brain-web',TOKEN)
+    pst.TokenStore.add(home/'piper-shared-thread/tokens.json','charm',CHARM_TOKEN)
     model=ThreadingHTTPServer(('127.0.0.1',0),Model)
     model.requests=[]; model.blocked=threading.Event(); model.release=threading.Event(); model.blocked2=threading.Event(); model.release2=threading.Event(); model.hold_compress=threading.Event(); model.compress_blocked=threading.Event(); model.compress_release=threading.Event(); model.summaries=0
     thread=threading.Thread(target=model.serve_forever); thread.start(); port=free_port(); ready=asyncio.Queue()
@@ -57,6 +59,8 @@ async def main():
             except sqlite3.Error: pass
             await asyncio.sleep(.1)
           else: raise AssertionError('telegram seed did not settle')
+          # The connector redelivering the exact message must not create another event.
+          await ws.send(json.dumps({'type':'inbound','event':{'text':'fixture seed','message_id':'tg-fixture-1','source':{'platform':'telegram','chat_id':CHAT,'chat_type':'dm','user_id':CHAT,'user_name':'Fixture'}}})+'\n')
           import subprocess
           st, info = await asyncio.to_thread(http,port,'GET',PREFIX+'/thread',None,TOKEN)
           assert st==200 and info['capabilities']['attachments_v1'] is True,(st,info)
@@ -71,10 +75,21 @@ async def main():
           paths=list(home.glob('piper-shared-thread/native-media-private/*/*/*_note.txt'))
           assert len(paths)==1 and paths[0].read_bytes()==b'hello',paths
           assert any('note.txt' in json.dumps(req['messages']) for req in model.requests),model.requests
+          charm={'turn_id':'charm-turn-0001','text':'fixture charm input'}
+          st,reply=await asyncio.to_thread(http,port,'POST',PREFIX+'/turns',charm,CHARM_TOKEN)
+          assert st==202,(st,reply)
+          st,reply=await asyncio.to_thread(http,port,'GET',PREFIX+'/turns/charm-turn-0001?wait=25',None,CHARM_TOKEN)
+          assert st==200 and reply['state']=='completed',(st,reply)
+          st,reply=await asyncio.to_thread(http,port,'POST',PREFIX+'/turns',charm,CHARM_TOKEN)
+          assert st==200,(st,reply)
           with sqlite3.connect(f'file:{home / "state.db"}?mode=ro',uri=True) as db:
-              rows=db.execute('select turn_id,state from piper_turn_outbox').fetchall()
-          assert rows==[('web-0123456789abcdef0123','pending')],rows
-          print('COMBINED_RC_PASS normal_chat=terminal SB_file=202 replay=200 file_turn=completed bytes=hello outbox=1_pending',flush=True)
+              rows=db.execute('select a.principal_id,a.request_id,o.turn_id,o.state from piper_turn_outbox o join session_admissions a on a.admission_id=o.admission_id').fetchall()
+          assert len(rows)==3,rows
+          assert sum(p.startswith('messaging:') for p,_,_,_ in rows)==1,rows
+          assert sum('charm' in req for _,req,_,_ in rows)==1,rows
+          assert sum(t=='web-0123456789abcdef0123' for _,_,t,_ in rows)==1,rows
+          assert all(state=='pending' for _,_,_,state in rows),rows
+          print('COMBINED_RC_PASS telegram=1 charm=1 web_file=1 replay=no_duplicate bytes=hello',flush=True)
         finally:
           task.cancel()
           try: await task

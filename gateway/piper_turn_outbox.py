@@ -1,4 +1,4 @@
-"""Opt-in durable completion records for the existing Piper shared-thread web producer.
+"""Opt-in durable completions for the configured shared conversation.
 
 This is a local outbox only: it does not send notifications or expose a network API.
 The owner inserts inside the same transaction as its ordinary terminal settlement.
@@ -15,22 +15,41 @@ _ID = re.compile(r'^web-[A-Za-z0-9_-]{16,60}$')
 
 
 def eligible_turn(row, route, response, outcome, *, configured=None):
-    """Return the web turn id only for a completed, non-silent shared-thread reply."""
-    if not configured or route != configured or row.get('principal_id') != 'automation:' + route:
+    """Return a receiver-compatible turn ID for eligible shared-conversation replies.
+
+    Non-web turns use an opaque ID derived from the unique authority admission,
+    so their transport identity is not disclosed and replay cannot create a second event.
+    """
+    if not configured or route != configured:
         return None
     if outcome != 'completed' or not isinstance(response, str) or not response.strip():
         return None
     if is_intentional_silence_response(response):
         return None
-    try:
-        identity = json.loads(row.get('request_id', ''))
-    except (TypeError, ValueError):
+    principal = row.get('principal_id')
+    if principal == 'automation:' + route:
+        try:
+            identity = json.loads(row.get('request_id', ''))
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(identity, list) or len(identity) != 3 or identity[0] != 'piper-shared-thread':
+            return None
+        surface, turn = identity[1:]
+        if surface == 'second-brain-web':
+            return turn if isinstance(turn, str) and _ID.fullmatch(turn) else None
+        if surface != 'charm' or not isinstance(turn, str) or not re.fullmatch(r'[A-Za-z0-9_-]{8,64}', turn):
+            return None
+    elif isinstance(principal, str) and principal.startswith('messaging:'):
+        try:
+            source = json.loads(principal[len('messaging:'):])
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(source, list) or len(source) != 5 or source[1] != 'telegram':
+            return None
+    else:
         return None
-    if (not isinstance(identity, list) or len(identity) != 3
-            or identity[:2] != ['piper-shared-thread', 'second-brain-web']
-            or not isinstance(identity[2], str) or not _ID.fullmatch(identity[2])):
-        return None
-    return identity[2]
+    admission = row.get('admission_id')
+    return 'web-' + admission if isinstance(admission, str) and re.fullmatch(r'[a-f0-9]{32}', admission) else None
 
 
 def ensure_terminal_column(conn):
