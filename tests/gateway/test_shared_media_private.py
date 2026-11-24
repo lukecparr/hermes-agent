@@ -169,6 +169,36 @@ def test_native_settlement_sweeps_expired_private_but_keeps_history(tmp_path, mo
     assert not Path(orphan['path']).exists() and Path(historical['path']).read_bytes() == b'history'
 
 
+def test_cross_process_collector_fenced_until_private_admission_commits(tmp_path, monkeypatch):
+    """A competing process cannot reap capture bytes before the admission is durable."""
+    from gateway.session_shared_media_private import private_store, capture_private, recover_private
+    from hermes_state import SessionDB
+    from hermes_state_runtime import begin_runtime_epoch, admit_session_input
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    db = SessionDB(db_path=tmp_path / 'state.db')
+    db.create_session('session', source='test')
+    epoch = begin_runtime_epoch(db, instance_id='fence-fixture')
+    contender = '''
+import sys
+from gateway.session_shared_media_private import private_store
+try:
+    with private_store(blocking=False): pass
+except BlockingIOError:
+    sys.exit(0)
+sys.exit(1)
+'''
+    with private_store() as root:
+        ref = capture_private(root, 'proof.txt', b'fixture bytes')
+        result = subprocess.run([sys.executable, '-c', contender], env=dict(os.environ), timeout=20)
+        assert result.returncode == 0
+        assert Path(ref['path']).read_bytes() == b'fixture bytes'
+        admit_session_input(db, epoch=epoch, principal_id='test', session_id='session',
+                            request_id='fixture', payload={'text': 'x', 'native_text_v1': {'media': [ref]}})
+    with private_store() as root:
+        assert recover_private(root, db, older_than=time.time() + 10) == 0
+        assert Path(ref['path']).read_bytes() == b'fixture bytes'
+
+
 def test_private_capture_lock_fences_other_process(tmp_path, monkeypatch):
     import fcntl
     from gateway.session_shared_media_private import private_root
