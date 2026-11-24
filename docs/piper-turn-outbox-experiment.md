@@ -31,6 +31,27 @@ The Piper writer inserts `piper.turn.completed.v1` only for an actual shared-thr
 - Queued cancellation, replacement, and queued steer transfer settle without executing an independent turn; they do not invoke this execution-settlement extension. Retired admission/tombstone paths and the `retain_result` test helper are not a new production completion hook. The extension is not a universal observer of every terminal admission.
 - SIGKILL tests interrupt a separate owner process immediately after outbox insertion but before COMMIT and immediately after COMMIT, on both normal and same-owner captured-result paths. Before COMMIT neither event nor terminal result survives; after COMMIT both survive. Recovery before commit is interrupted, not a fabricated completed answer.
 
+## Isolated real-gateway normal-chat smoke test
+
+`scripts/piper_gateway_normal_probe.py` starts the actual gateway in the foreground,
+with a fresh scratch profile and a loopback-only fake model. It admits a normal
+interactive chat turn, checks the transcript, and waits for the SQLite admission
+to settle completed. Run both the default-off configuration and the required-writer
+configuration with a Python environment containing the existing gateway test deps:
+
+```sh
+env -i PATH="$PATH" TMPDIR=/absolute/disposable/scratch python -B scripts/piper_gateway_normal_probe.py
+env -i PATH="$PATH" TMPDIR=/absolute/disposable/scratch python -B scripts/piper_gateway_normal_probe.py --required
+```
+
+The required case also verifies one required writer is registered. Each invocation
+uses a new temporary profile, strips inherited credentials/settings and contacts
+only loopback. It leaves the scratch home for safe cleanup after process exit.
+This checks ordinary interactive chat, not the shared-web turn or notification
+path; it does not prove behavior when the required writer fails. It does not use
+Firebase, a phone, or a real agent provider. The required writer still intentionally
+fails settlement closed on registration or callback failure.
+
 ## Limitations and next steps
 
 - The authority's captured-result unknown-resolution path writes the outbox in the same transaction for a result still held by the same owner. After a process death that in-memory capture is lost: boot recovery settles an unattended unknown as interrupted, without inventing a completion or notification. Durable capture prior to settlement is not implemented; adding it would need a separately fenced result journal, retention/deletion and redaction rules, safe cross-epoch adoption, and correct handling of transcript and steer-transfer state. Even a journal cannot recover an answer if the process dies before the journal commit. Do not enable until that design and real gateway configuration are verified.
