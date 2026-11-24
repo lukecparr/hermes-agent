@@ -4,7 +4,15 @@ This branch is an isolated experimental producer and sender, not a push implemen
 
 The installed `piper-shared-thread` plugin admits Second Brain web inputs through the existing gateway authority as `automation:<route>`, with request identity JSON `["piper-shared-thread","second-brain-web",turn_id]`. The normal in-process authority drain calls `commit_and_publish` -> `finish_result` -> `settle_session_input`. The latter commits the terminal admission, result and `_terminal_write` in one SQLite transaction. `admission_id` is created as a UUID on admission; exact admission replay returns the existing row. The plugin also keeps its own turn-id ledger. The outbox stores both ids, without message text or credentials.
 
-The experimental `contrib/piper-turn-outbox` plugin registers a generic in-process settlement writer. It is not installed by this branch. If explicitly enabled in an isolated profile, the profile config must name it in `gateway.required_settlement_plugins`, enable it under `plugins.enabled`, and set `plugins.entries.piper-turn-outbox.settings.route`. The route must exactly match the gateway live route. The former `PIPER_TURN_OUTBOX_ROUTE` environment switch no longer enables the producer. A missing, disabled, broken, timed-out, or host-isolated required plugin refuses authority startup before epoch rotation, and is checked again at settlement after reloads, rather than dropping the event. An empty required list runs no writers. Do not enable this experiment in production.
+## Recommended chat-first policy (experimental)
+
+Use `gateway.optional_settlement_plugins: [piper-turn-outbox]` in disposable staging; keep the feature disabled in production. An optional writer runs under a SQLite savepoint: a callback exception rolls back that writer's partial changes and logs a fixed error while ordinary chat settlement continues. A missing/disabled writer also logs and skips notifications. This deliberately trades notification completeness for chat availability: dropped notifications cannot be replayed from the outbox. A severe database failure that prevents savepoint rollback/release can still block settlement. Required writers retain their original strict behavior for other uses. Both lists default empty and a writer cannot appear in both.
+
+The legacy required-writer configuration and failure analysis below describe an alternative, not the recommended policy for Piper. No production deployment or enablement is authorized.
+
+## Legacy required-writer configuration
+
+The experimental `contrib/piper-turn-outbox` plugin registers a generic in-process settlement writer. It is not installed by this branch. If explicitly enabled in an isolated profile, the profile config must name it in `gateway.required_settlement_plugins`, enable it under `plugins.enabled`, and set `plugins.entries.piper-turn-outbox.settings.route`. The route must exactly match the gateway live route. The former `PIPER_TURN_OUTBOX_ROUTE` environment switch no longer enables the producer. A missing, disabled, broken, timed-out, or host-isolated required plugin refuses authority startup before epoch rotation, and is checked again at settlement after reloads, rather than dropping the event. An empty required list runs no required writers; optional writers can still be configured. Do not enable this experiment in production.
 
 For an isolated profile only, the required settings have this shape (the plugin directory must first be available to normal plugin discovery):
 
@@ -51,6 +59,10 @@ This checks ordinary interactive chat, not the shared-web turn or notification
 path; it does not prove behavior when the required writer fails. It does not use
 Firebase, a phone, or a real agent provider. The required writer still intentionally
 fails settlement closed on registration or callback failure.
+
+## Foreground shared-web integration probe
+
+An isolated foreground real-gateway run on this branch used a synthetic relay and loopback model, admitted a shared-web turn with the optional writer, and committed one completion row. The row's event was handed off via a local scratch file to the actual Second Brain receiver with disposable PGlite SQL and a mocked FCM transport. The receiver returned 204 for the event and replay, queued only the opted-in synthetic Android device, and the dispatcher sent one mocked message. The file handoff bypassed the Hermes HTTP sender and the Second Brain web proxy, so this is not a continuous wire-level end-to-end test. No real phone or Firebase was used.
 
 ## Limitations and next steps
 

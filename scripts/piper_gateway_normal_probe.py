@@ -49,9 +49,10 @@ class Model(BaseHTTPRequestHandler):
 
 
 async def main():
-    if set(sys.argv[1:]) - {'--required'} or len(sys.argv) > 2:
-        raise SystemExit('usage: piper_gateway_normal_probe.py [--required]')
+    if set(sys.argv[1:]) - {'--required', '--optional'} or len(sys.argv) > 2:
+        raise SystemExit('usage: piper_gateway_normal_probe.py [--required|--optional]')
     required = '--required' in sys.argv
+    optional = '--optional' in sys.argv
     scratch = os.environ.get('TMPDIR')
     if not scratch or not Path(scratch).is_absolute():
         raise SystemExit('TMPDIR must name an absolute disposable scratch directory')
@@ -74,10 +75,10 @@ async def main():
     config = {'gateway': {'multiplex_profiles': False},
               'model': {'provider': 'custom', 'default': 'loopback-fixture', 'base_url': url},
               'auxiliary': {'title_generation': {'enabled': False}}}
-    if required:
+    if required or optional:
         (home / 'plugins').mkdir()
         shutil.copytree(ROOT / 'contrib/piper-turn-outbox', home / 'plugins/piper-turn-outbox')
-        config['gateway']['required_settlement_plugins'] = ['piper-turn-outbox']
+        config['gateway']['required_settlement_plugins' if required else 'optional_settlement_plugins'] = ['piper-turn-outbox']
         config['plugins'] = {'isolation': 'in_process', 'enabled': ['piper-turn-outbox'],
                              'entries': {'piper-turn-outbox': {'settings': {
                                  'route': 'agent:main:telegram:dm:fixture'}}}}
@@ -102,7 +103,7 @@ async def main():
             assert descriptor and descriptor.get('state') == 'ready', descriptor
             assert descriptor['served_profiles'] == [{'profile_id': str(home), 'home': str(home)}]
             assert descriptor['api_origin'].startswith('http://127.0.0.1:'), descriptor['api_origin']
-            if required:
+            if required or optional:
                 from gateway.session_settlement_extensions import required_extensions
                 from types import SimpleNamespace
                 callbacks = await asyncio.to_thread(
@@ -141,7 +142,7 @@ async def main():
                     await asyncio.sleep(.1)
                 assert rows == [('terminal', 'completed')], rows
                 assert model.requests >= 1, model.requests
-                print(f'PASS real gateway normal chat: required_plugin={required}; terminal=completed; model_requests={model.requests}', flush=True)
+                print(f'PASS real gateway normal chat: required_plugin={required}; optional_plugin={optional}; terminal=completed; model_requests={model.requests}', flush=True)
         finally:
             task.cancel()
             try:

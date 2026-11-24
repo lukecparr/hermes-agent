@@ -12,12 +12,12 @@ ROUTE = 'agent:main:telegram:dm:test'
 TURN = 'web-1234567890123456'
 
 
-def setup_config(home, *, install=True, plugin_name='piper-turn-outbox'):
+def setup_config(home, *, install=True, plugin_name='piper-turn-outbox', optional=False):
     if install:
         source = Path(__file__).resolve().parents[2] / 'contrib' / 'piper-turn-outbox'
         shutil.copytree(source, home / 'plugins' / 'piper-turn-outbox')
     (home / 'config.yaml').write_text(
-        f'gateway:\n  required_settlement_plugins: [{plugin_name}]\n'
+        f'gateway:\n  {"optional" if optional else "required"}_settlement_plugins: [{plugin_name}]\n'
         f'plugins:\n  enabled: [piper-turn-outbox]\n  entries:\n'
         f'    piper-turn-outbox:\n      settings:\n        route: "{ROUTE}"\n')
 
@@ -40,6 +40,48 @@ def test_real_plugin_discovery_writes_with_settlement(owner, tmp_path, monkeypat
     import gateway.session_settlement_recovery as recovery
     monkeypatch.setattr(recovery, 'owner_stop_notice', lambda *_: None)
     setup_config(tmp_path)
+    row = claim(owner)
+    finish(owner, row)
+    with owner.db._read_ctx() as conn:
+        assert tuple(conn.execute('SELECT admission_id, turn_id FROM piper_turn_outbox').fetchone()) == (
+            row['admission_id'], TURN)
+
+
+def test_piper_outbox_failure_rolls_back_only_notification(owner, tmp_path, monkeypatch, caplog):
+    import gateway.piper_turn_outbox as outbox
+    import gateway.session_settlement_recovery as recovery
+    monkeypatch.setattr(recovery, 'owner_stop_notice', lambda *_: None)
+    original = outbox.insert_completion
+
+    def fail_after_insert(conn, admission_id, turn_id):
+        original(conn, admission_id, turn_id)
+        raise RuntimeError('private marker must not enter logs')
+
+    monkeypatch.setattr(outbox, 'insert_completion', fail_after_insert)
+    setup_config(tmp_path, optional=True)
+    row = claim(owner)
+    finish(owner, row)
+    assert get_session_admission(owner.db, admission_id=row['admission_id'])['outcome'] == 'completed'
+    with owner.db._read_ctx() as conn:
+        assert conn.execute("SELECT count(*) FROM sqlite_master WHERE name='piper_turn_outbox'").fetchone()[0] == 0
+    assert 'Optional settlement writer failed; its effects were dropped' in caplog.text
+    assert 'private marker' not in caplog.text
+
+
+def test_missing_optional_writer_does_not_block_settlement(owner, tmp_path, monkeypatch, caplog):
+    import gateway.session_settlement_recovery as recovery
+    monkeypatch.setattr(recovery, 'owner_stop_notice', lambda *_: None)
+    setup_config(tmp_path, install=False, optional=True)
+    row = claim(owner)
+    finish(owner, row)
+    assert get_session_admission(owner.db, admission_id=row['admission_id'])['outcome'] == 'completed'
+    assert 'Optional settlement plugin unavailable' in caplog.text
+
+
+def test_optional_writer_success_still_commits_event(owner, tmp_path, monkeypatch):
+    import gateway.session_settlement_recovery as recovery
+    monkeypatch.setattr(recovery, 'owner_stop_notice', lambda *_: None)
+    setup_config(tmp_path, optional=True)
     row = claim(owner)
     finish(owner, row)
     with owner.db._read_ctx() as conn:
