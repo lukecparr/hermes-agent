@@ -133,6 +133,41 @@ async def test_captured_unknown_recovery_commits_one_event(owner, monkeypatch):
     assert len(events(owner)) == 1
 
 
+@pytest.mark.asyncio
+async def test_captured_unknown_outbox_failure_rolls_back_resolution(owner, monkeypatch):
+    from gateway.session_authority import LiveSession
+    from gateway.session_contract import Principal, SessionRef
+    import gateway.piper_turn_outbox as outbox
+
+    monkeypatch.setenv('PIPER_TURN_OUTBOX_ROUTE', ROUTE)
+    row = claim(owner)
+    owner.sessions[TURN] = LiveSession(None, ROUTE)
+    owner.pending_results[row['admission_id']] = {
+        'result': {'final_response': 'answer', 'messages': [], 'completed': True}, 'usage': {}}
+    owner.db._execute_write(lambda conn: conn.execute(
+        "UPDATE session_admissions SET status='unknown' WHERE admission_id=?", (row['admission_id'],)))
+    original = outbox.insert_completion
+
+    def fail(conn, admission_id, turn_id):
+        original(conn, admission_id, turn_id)
+        raise sqlite3.OperationalError('simulated recovery write failure')
+
+    monkeypatch.setattr(outbox, 'insert_completion', fail)
+    async def resolved(_ref, _id, _prepared, _captured, result):
+        return result
+    monkeypatch.setattr(owner, '_resolved_unknown', resolved)
+    actor = Principal('human', owner.profile_id, frozenset({'session:control', 'session:submit'}), 'test')
+    ref = SessionRef(owner.profile_id, TURN)
+    with pytest.raises(sqlite3.OperationalError, match='simulated recovery write failure'):
+        await owner.resolve_unknown(actor, ref, row['admission_id'], row['generation'])
+    assert get_session_admission(owner.db, admission_id=row['admission_id'])['status'] == 'unknown'
+    assert events(owner) == []
+    monkeypatch.setattr(outbox, 'insert_completion', original)
+    result = await owner.resolve_unknown(actor, ref, row['admission_id'], row['generation'])
+    assert result['outcome'] == 'completed'
+    assert events(owner) == [(row['admission_id'], TURN, 'piper.turn.completed.v1')]
+
+
 def test_outbox_failure_rolls_back_settlement(owner, monkeypatch):
     import gateway.piper_turn_outbox as outbox
     monkeypatch.setenv('PIPER_TURN_OUTBOX_ROUTE', ROUTE)
