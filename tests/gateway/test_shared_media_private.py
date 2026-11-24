@@ -33,6 +33,20 @@ def test_private_owner_survives_process_death_without_shared_cache_alias(tmp_pat
         assert not private.exists() and other.read_bytes() == b'other producer'
 
 
+def test_private_lock_rejects_hardlinks(tmp_path, monkeypatch):
+    from gateway.session_shared_media_private import private_store, private_root
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    with private_store():
+        pass
+    lock = private_root() / '.lock'
+    alias = tmp_path / 'lock-alias'
+    os.link(lock, alias)
+    with pytest.raises(OSError, match='unsafe private media lock'):
+        with private_store():
+            pass
+    assert alias.exists() and lock.exists()
+
+
 def test_private_store_refuses_symlink_and_inspection_never_unlinks(tmp_path, monkeypatch):
     from gateway.session_shared_media_private import private_store, capture_private, inspect_private_owners
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
