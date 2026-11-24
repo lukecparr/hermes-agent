@@ -416,11 +416,12 @@ def _file_identity(path):
 
 
 def _held_file_identities(paths, root):
+    from gateway.session_shared_media_private import is_private_path
     identities = set()
     try:
         for value in paths:
             path = Path(value)
-            if path.parent.parent != root or path.parent.resolve() != path.parent:
+            if not is_private_path(path) and (path.parent.parent != root or path.parent.resolve() != path.parent):
                 return None
             identities.add(_file_identity(path))
     except (OSError, ValueError):
@@ -454,6 +455,17 @@ def release_admission_media(db, admission_id):
     # collects them through ``retire_media``; ``sweep_settled_media`` bounds the rest at main's 24 h.
     released = release_unheld_media(db, admission_media_references(row['payload']))
     released += release_unheld_media(db, hosted_document_references(row['request_id'], row['payload']))
+    from gateway.session_shared_media_private import is_private_path, private_store, recover_private
+    if any(is_private_path(reference['path']) for reference in admission_media_references(row['payload'])):
+        # The experimental namespace owns its own lock and cannot be swept by
+        # the native cache collector. Fail closed if recovery cannot inspect it.
+        import time
+        from agent.provider_media import MEDIA_CACHE_MAX_AGE_HOURS
+        try:
+            with private_store() as private:
+                released += recover_private(private, db, older_than=time.time() - MEDIA_CACHE_MAX_AGE_HOURS * 3600)
+        except (OSError, ValueError, sqlite3.DatabaseError):
+            logger.warning('Private media recovery failed; retaining files', exc_info=True)
     return released + sweep_settled_media(db)
 
 
@@ -597,6 +609,7 @@ def release_unheld_media(db, references, *, retain_history=True):
 def restore_native_media(references):
     if not references:
         return []
+    from gateway.session_shared_media_private import is_private_path
     root = _media_root()
     paths = []
     try:
@@ -604,7 +617,7 @@ def restore_native_media(references):
             if set(reference) != {'path', 'sha256', 'size'}:
                 raise ValueError('invalid media reference')
             path = Path(reference['path'])
-            if (path.parent.parent != root or path.resolve() != path
+            if ((path.parent.parent != root and not is_private_path(path)) or path.resolve() != path
                     or path.parent.name != reference['sha256']):
                 raise ValueError('foreign media reference')
             with _open_regular(path) as source:

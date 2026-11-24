@@ -522,10 +522,8 @@ def _shared_thread_media_identity(identity):
 
 
 async def _admit_automation_media(authority, adapter, event, identity, replaces):
-    import asyncio
     from pathlib import Path
     from hermes_constants import get_hermes_home
-    from gateway.session_ingress_media import abandon_capture, capture_lease, capture_native_media
     if (not _shared_thread_media_identity(identity) or replaces is not None
             or not isinstance(event.media_urls, list) or not 1 <= len(event.media_urls) <= 3
             or not isinstance(event.media_types, list) or len(event.media_types) != len(event.media_urls)
@@ -539,28 +537,27 @@ async def _admit_automation_media(authority, adapter, event, identity, replaces)
     if any(not p.is_absolute() or p.parent.parent != root or p.resolve() != p for p in paths):
         raise RuntimeStoreError('invalid_params')
     payload, entry = snapshot_automation(authority, adapter, event, identity)
-    from gateway.session_shared_media_intent import CaptureIntent
-    intent = await asyncio.to_thread(CaptureIntent().acquire)
-    with capture_lease(authority) as scope:
-        try:
-            references = await asyncio.to_thread(capture_native_media, paths, before_publish=intent.record)
-            if sum(ref['size'] for ref in references) > 5 * 1024 * 1024:
-                raise RuntimeStoreError('invalid_params')
-            # A reset or connector change while bytes were being captured must
-            # not retarget this producer to a different conversation.
-            again, current = snapshot_automation(authority, adapter, event, identity)
-            if current.session_id != entry.session_id or again != payload:
-                raise RuntimeStoreError('admission_conflict')
-            payload['native_text_v1']['media'] = references
-            payload['native_text_v1']['event']['media_types'] = list(event.media_types)
-            payload['native_text_v1']['event']['media_text_inlined'] = [False] * len(references)
-            return await _admit_automation(authority, adapter, event, identity, replaces,
-                                           payload_entry=(payload, entry))
-        except BaseException:
-            await abandon_capture(scope)
-            raise
-        finally:
-            intent.release()
+    return await _admit_automation(authority, adapter, event, identity, replaces,
+                                   payload_entry=(payload, entry), media_paths=paths,
+                                   media_types=tuple(event.media_types))
+
+
+def _write_automation_private(authority, adapter, event, entry, ref, identity, payload, authorize, paths, media_types):
+    """Capture and commit in one ordered worker, fenced against other processes' collectors."""
+    from gateway.session_shared_media_private import private_store, capture_private_batch, recover_private
+    from agent.provider_media import MEDIA_CACHE_MAX_AGE_HOURS
+    import time
+    with private_store() as root:
+        recover_private(root, authority.db, older_than=time.time() - MEDIA_CACHE_MAX_AGE_HOURS * 3600)
+        references = capture_private_batch(root, paths)
+        again, current = snapshot_automation(authority, adapter, event, identity)
+        if (current.session_id != entry.session_id or again != payload
+                or tuple(event.media_urls) != tuple(map(str, paths)) or tuple(event.media_types) != media_types):
+            raise RuntimeStoreError('admission_conflict')
+        payload['native_text_v1']['media'] = references
+        payload['native_text_v1']['event']['media_types'] = list(media_types)
+        payload['native_text_v1']['event']['media_text_inlined'] = [False] * len(references)
+        return _write_automation(authority, entry, ref, identity, payload, authorize)
 
 
 def _write_automation(authority, entry, ref, identity, payload, authorize):
@@ -598,7 +595,8 @@ async def admit_automation(authority, adapter, event, identity, replaces=None):
     return await _admit_automation(authority, adapter, event, identity, replaces)
 
 
-async def _admit_automation(authority, adapter, event, identity, replaces=None, *, payload_entry=None):
+async def _admit_automation(authority, adapter, event, identity, replaces=None, *, payload_entry=None,
+                            media_paths=None, media_types=None):
     """``replaces``: a queued automation row of the same session this input supersedes (a liveness
     tick carrying the output of the one still waiting). Its cancellation commits in this admission's
     own transaction, so neither lands without the other."""
@@ -616,9 +614,11 @@ async def _admit_automation(authority, adapter, event, identity, replaces=None, 
             if replaced:  # the guard ran in the committed write; an exact replay runs no guard
                 authority._settle_cancelled(ref, replaces)
             return admitted(row)
-    return await tracked_write(authority, partial(
-        _write_automation, authority, entry, ref, identity, deepcopy(payload),
-        authority._admission_gate(replaces and _replace_queued(replaces, ref.session_id, replaced))),
+    authorize = authority._admission_gate(replaces and _replace_queued(replaces, ref.session_id, replaced))
+    write = (partial(_write_automation_private, authority, adapter, event, entry, ref, identity,
+                     deepcopy(payload), authorize, media_paths, media_types) if media_paths is not None else
+             partial(_write_automation, authority, entry, ref, identity, deepcopy(payload), authorize))
+    return await tracked_write(authority, write,
         then=admitted, ordered=True, after=partial(authority._schedule_admitted, ref))
 
 

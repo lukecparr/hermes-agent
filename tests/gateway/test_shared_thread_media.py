@@ -11,6 +11,71 @@ from pathlib import Path
 import pytest
 
 
+@pytest.mark.parametrize('kill_point', ['before', 'after'])
+def test_real_gateway_admission_sigkill_recovery(tmp_path, monkeypatch, kill_point):
+    """Kill the gateway's real ordered writer around its SQLite admission commit."""
+    from gateway.session_shared_media_private import private_store, inspect_private_owners, recover_private
+    from gateway.session_ingress_media import restore_native_media
+    from hermes_state import SessionDB
+    import time
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    code = r'''
+import asyncio, json, os, signal, sys
+from pathlib import Path
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.event import MessageEvent
+from gateway.run import GatewayRunner
+from gateway.session_authority import initialize_session_authority, SessionAuthority
+from gateway.session_ingress_context import native_callback
+from hermes_constants import get_hermes_home
+from plugins.platforms.discord.adapter import DiscordAdapter
+import gateway.session_automation as automation
+SessionAuthority._schedule = lambda self, ref: None
+automation.SHARED_THREAD_MEDIA_V1 = True
+original = automation._write_automation
+def crash(*args, **kwargs):
+    if sys.argv[1] == 'before':
+        os.kill(os.getpid(), signal.SIGKILL)
+    result = original(*args, **kwargs)
+    os.kill(os.getpid(), signal.SIGKILL)
+automation._write_automation = crash
+async def run():
+    runner = GatewayRunner(GatewayConfig())
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token='fixture-token', typing_indicator=False))
+    runner.adapters = {Platform.DISCORD: adapter}
+    authority = await initialize_session_authority(runner, profile_id='default', instance_id='crash')
+    runner._wire_adapter_handlers(adapter)
+    source = adapter.build_source(chat_id='42', chat_type='dm', user_id='42')
+    human_event = MessageEvent(text='human', source=source, message_id='human')
+    with native_callback(runner, human_event, get_hermes_home()):
+        human = await authority.admit_native(human_event)
+    route = runner.session_store._generate_session_key(source)
+    path = get_hermes_home() / 'piper-shared-thread' / 'attachments' / 'staging' / 'proof.txt'
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b'gateway crash fixture')
+    event = MessageEvent(text='look', source=source, internal=True, media_urls=[str(path)],
+        media_types=['text/plain'], metadata={'gateway_session_key': route,
+                                               'gateway_session_id': human.ref.session_id})
+    identity = json.dumps(['piper-shared-thread', 'second-brain-web', 'web-crash001'], separators=(',', ':'))
+    await authority.admit_automation(adapter, event, identity)
+asyncio.run(run())
+'''
+    env = dict(os.environ, HERMES_HOME=str(tmp_path), DISCORD_ALLOWED_USERS='42')
+    proc = subprocess.run([sys.executable, '-c', code, kill_point], env=env, timeout=30)
+    assert proc.returncode == -signal.SIGKILL
+    db = SessionDB(db_path=tmp_path / 'state.db')
+    with private_store() as root:
+        owners = inspect_private_owners(root)
+        assert len(owners) == 1
+        ref = owners[0]['files'][0]
+        removed = recover_private(root, db, older_than=time.time() + 10)
+        if kill_point == 'before':
+            assert removed == 1 and not Path(ref['path']).exists()
+        else:
+            assert removed == 0 and restore_native_media([ref]) == [ref['path']]
+            assert Path(ref['path']).read_bytes() == b'gateway crash fixture'
+
+
 def test_intent_lock_survives_cross_process_contention_and_releases_on_kill(tmp_path, monkeypatch):
     import fcntl
     from gateway.session_shared_media_intent import CaptureIntent, inspect_intents
@@ -122,6 +187,7 @@ async def test_shared_media_is_captured_and_exact_retry_is_idempotent(tmp_path, 
     row = next(row for row in rows if row['request_id'] == identity)
     restored = restore_native(row['payload'], runner)
     assert Path(restored.media_urls[0]).read_bytes() == photo.read_bytes()
+    assert 'native-media-private' in Path(restored.media_urls[0]).parts
     assert restored.media_types == ['image/png']
     assert release_unheld_media(authority.db, row['payload']['native_text_v1']['media'], retain_history=False) == 0
     assert Path(restored.media_urls[0]).exists()
@@ -196,14 +262,14 @@ async def test_shared_media_is_captured_and_exact_retry_is_idempotent(tmp_path, 
     # Caller cancellation while the capture runs must not orphan or lose a
     # later committed input: the shielded tracked mutation finishes ownership.
     monkeypatch.setattr(automation, 'admit_session_input', original_admit)
-    import gateway.session_ingress_media as media
-    original_capture = media.capture_native_media
+    import gateway.session_shared_media_private as media
+    original_capture = media.capture_private_batch
     entered, release_capture = threading.Event(), threading.Event()
-    def paused_capture(paths, **kwargs):
+    def paused_capture(root, paths):
         entered.set()
         assert release_capture.wait(10)
-        return original_capture(paths, **kwargs)
-    monkeypatch.setattr(media, 'capture_native_media', paused_capture)
+        return original_capture(root, paths)
+    monkeypatch.setattr(media, 'capture_private_batch', paused_capture)
     event.metadata['gateway_session_id'] = newest.session_id
     cancelled_id = json.dumps(['piper-shared-thread', 'second-brain-web', 'web-cancel001'], separators=(',', ':'))
     cancelled = asyncio.create_task(authority.admit_automation(adapter, event, cancelled_id))

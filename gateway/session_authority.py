@@ -1389,6 +1389,13 @@ async def initialize_session_authority(runner, *, profile_id, instance_id, db=No
     # A lost automation turn has nobody to resolve it: it settles interrupted before any FIFO runs.
     from gateway.session_unattended_unknown import settle_recovered_unattended
     await asyncio.to_thread(settle_recovered_unattended, db, epoch)
+    # A killed capture can have no admission row at all. Scan the existing
+    # private namespace after recovery, even if new uploads are disabled.
+    from gateway.session_shared_media_private import sweep_private
+    try:
+        await asyncio.to_thread(sweep_private, db)
+    except Exception:
+        logger.warning('Private media recovery failed; retaining files', exc_info=True)
     await asyncio.to_thread(backfill_legacy_session_owners, db)
     await asyncio.to_thread(backfill_compression_created_sources, db)
     authority = SessionAuthority(runner, profile_id=profile_id, instance_id=instance_id, db=db, epoch=epoch)
