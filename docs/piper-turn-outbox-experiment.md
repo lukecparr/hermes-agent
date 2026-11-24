@@ -62,7 +62,7 @@ fails settlement closed on registration or callback failure.
 
 ## Foreground shared-web integration probe
 
-An isolated foreground real-gateway run on this branch used a synthetic relay and loopback model, admitted a shared-web turn with the optional writer, and committed one completion row. The row's event was handed off via a local scratch file to the actual Second Brain receiver with disposable PGlite SQL and a mocked FCM transport. The receiver returned 204 for the event and replay, queued only the opted-in synthetic Android device, and the dispatcher sent one mocked message. The file handoff bypassed the Hermes HTTP sender and the Second Brain web proxy, so this is not a continuous wire-level end-to-end test. No real phone or Firebase was used.
+An isolated foreground real-gateway run on this branch used a synthetic relay and loopback model, admitted a shared-web turn with the optional writer, and committed one completion row. In a subsequent foreground step, the actual sender leased that row from a SQLite backup of the disposable gateway database and posted it over loopback HTTP to the actual Second Brain receiver backed by disposable PGlite SQL. The receiver returned 204, queued the opted-in synthetic Android device, and its dispatcher made one mocked FCM send. The gateway had already stopped before the sender step; the SB web proxy, real Firebase and a phone were not tested.
 
 ## Limitations and next steps
 
