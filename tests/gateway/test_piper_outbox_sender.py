@@ -20,6 +20,22 @@ def db(tmp_path):
     conn.close()
 
 
+def test_sender_started_before_first_completion_waits(tmp_path):
+    path = tmp_path / 'state.db'
+    with sqlite3.connect(path, isolation_level=None) as conn:
+        assert send_one(conn, 'https://example.test/piper', TOKEN, now=1) == 'empty'
+        assert conn.execute("SELECT 1 FROM sqlite_master WHERE name='piper_turn_outbox'").fetchone() is None
+        insert_completion(conn, 'a' * 32, 'web-1234567890123456')
+        assert send_one(conn, 'https://example.test/piper', TOKEN, now=2, transport=lambda *_: 204) == 'sent'
+
+
+def test_existing_malformed_outbox_fails_closed(tmp_path):
+    with sqlite3.connect(tmp_path / 'state.db', isolation_level=None) as conn:
+        conn.execute('CREATE TABLE piper_turn_outbox (id TEXT)')
+        with pytest.raises(sqlite3.OperationalError):
+            send_one(conn, 'https://example.test/piper', TOKEN, now=1)
+
+
 def test_retry_and_receiver_dedup(db):
     seen, visible = set(), []
     def receiver(_url, _token, event):

@@ -1393,6 +1393,10 @@ async def initialize_session_authority(runner, *, profile_id, instance_id, db=No
     # yielding, so no other task observes a half-registered authority.
     from pathlib import Path
     db_key = await asyncio.to_thread(Path(db.db_path).resolve)
+    # Refuse a broken required extension before rotating the owner epoch or recovering
+    # any turns. Settlement checks again so later unload/config changes fail closed too.
+    from gateway.session_settlement_extensions import required_extensions
+    await asyncio.to_thread(required_extensions, db, profile_id)
     epoch = await asyncio.to_thread(begin_runtime_epoch, db, instance_id=instance_id)
     # Hot-serve builds a profile while the loop serves the others: both writes stay off it.
     await asyncio.to_thread(recover_session_inputs, db, epoch=epoch)

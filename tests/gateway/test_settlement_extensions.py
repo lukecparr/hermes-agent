@@ -70,6 +70,42 @@ def test_callback_uses_database_owner_profile(owner, tmp_path, monkeypatch):
         assert Path(conn.execute('SELECT home FROM scope_probe').fetchone()[0]) == profile
 
 
+def test_reload_refreshes_writer_and_unload_fails_closed(owner, tmp_path, monkeypatch):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_cli.plugins import get_plugin_manager
+    from gateway.session_settlement_extensions import required_extensions, write_extensions
+    import gateway.session_settlement_recovery as recovery
+    monkeypatch.setattr(recovery, 'owner_stop_notice', lambda *_: None)
+    setup_config(tmp_path)
+    plugin_file = tmp_path / 'plugins' / 'piper-turn-outbox' / '__init__.py'
+    def plugin(version):
+        return ('def register(ctx):\n'
+                '    def write(*, conn, **kwargs):\n'
+                '        conn.execute("CREATE TABLE IF NOT EXISTS reload_probe (version TEXT)")\n'
+                f'        conn.execute("INSERT INTO reload_probe VALUES (\'{version}\')")\n'
+                '    ctx.register_settlement_extension(write)\n')
+    plugin_file.write_text(plugin('first'))
+    first = required_extensions(owner.db, str(tmp_path))
+    token = set_hermes_home_override(tmp_path)
+    try:
+        manager = get_plugin_manager()
+        # Change the source size as well as the contents so Python cannot reuse timestamped bytecode.
+        plugin_file.write_text(plugin('second-version'))
+        manager.discover_and_load(force=True)
+        second = required_extensions(owner.db, str(tmp_path))
+        for callbacks in (first, second):
+            owner.db._execute_write(lambda conn: write_extensions(
+                owner.db, callbacks, conn, row={}, route=ROUTE, response='answer',
+                outcome='completed', result={}, profile_id=str(tmp_path)))
+        with owner.db._read_ctx() as conn:
+            assert [r[0] for r in conn.execute('SELECT version FROM reload_probe')] == ['first', 'second-version']
+        assert manager.unload('piper-turn-outbox')
+        with pytest.raises(RuntimeError, match='required settlement plugin unavailable'):
+            required_extensions(owner.db, str(tmp_path))
+    finally:
+        reset_hermes_home_override(token)
+
+
 def test_host_isolation_cannot_register_required_extension(owner, tmp_path, monkeypatch):
     import gateway.session_settlement_recovery as recovery
     monkeypatch.setattr(recovery, 'owner_stop_notice', lambda *_: None)
@@ -80,6 +116,40 @@ def test_host_isolation_cannot_register_required_extension(owner, tmp_path, monk
     with pytest.raises(RuntimeError, match='required settlement plugin unavailable'):
         finish(owner, row)
     assert get_session_admission(owner.db, admission_id=row['admission_id'])['status'] == 'started'
+
+
+@pytest.mark.asyncio
+async def test_startup_missing_plugin_does_not_fence_existing_owner(owner, tmp_path):
+    from gateway.session_authority import initialize_session_authority
+    from hermes_state_runtime import settle_session_input
+    setup_config(tmp_path, install=False)
+    row = claim(owner)
+    with pytest.raises(RuntimeError, match='required settlement plugin unavailable'):
+        await initialize_session_authority(owner.runner, profile_id=str(tmp_path), instance_id='new-owner',
+                                           db=owner.db, register=False)
+    # The old owner can still complete under its original epoch: startup refused before rotating it.
+    settled = settle_session_input(owner.db, epoch=owner.epoch, admission_id=row['admission_id'],
+                                   generation=row['generation'], outcome='failed')
+    assert settled['outcome'] == 'failed'
+
+
+def test_restart_loses_uncommitted_capture_and_does_not_invent_completion(owner, tmp_path):
+    from gateway.session_unattended_unknown import settle_recovered_unattended
+    from hermes_state_runtime import begin_runtime_epoch, recover_session_inputs
+    setup_config(tmp_path)
+    row = claim(owner)
+    # A captured result is held in the dead owner's memory, not durably stored.
+    owner.pending_results[row['admission_id']] = {
+        'result': {'final_response': 'answer', 'messages': [], 'completed': True}, 'usage': {}}
+    new_epoch = begin_runtime_epoch(owner.db, instance_id='restarted')
+    recover_session_inputs(owner.db, epoch=new_epoch)
+    assert get_session_admission(owner.db, admission_id=row['admission_id'])['status'] == 'unknown'
+    assert settle_recovered_unattended(owner.db, new_epoch) == 1
+    recovered = get_session_admission(owner.db, admission_id=row['admission_id'])
+    assert recovered['status'] == 'terminal'
+    assert recovered['outcome'] == 'interrupted'
+    with owner.db._read_ctx() as conn:
+        assert conn.execute("SELECT 1 FROM sqlite_master WHERE name='piper_turn_outbox'").fetchone() is None
 
 
 def test_missing_required_plugin_refuses_settlement(owner, tmp_path, monkeypatch):

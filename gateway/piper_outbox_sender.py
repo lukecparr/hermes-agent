@@ -34,6 +34,11 @@ def claim(conn, now, lease_seconds=120):
     """Lease one due row; a dead process's lease becomes eligible after expiry."""
     conn.execute('BEGIN IMMEDIATE')
     try:
+        # The producer creates the table only with the first eligible completion. A
+        # sender started first must wait rather than exit or create gateway schema.
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='piper_turn_outbox'").fetchone() is None:
+            conn.commit()
+            return None
         ensure_terminal_column(conn)
         row = conn.execute('''SELECT admission_id,turn_id,event_type,attempts FROM piper_turn_outbox
             WHERE (state='pending' AND next_attempt<=?) OR (state='leased' AND lease_until<=?)
