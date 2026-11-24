@@ -4439,6 +4439,22 @@ def _housekeeping_state_db_maintenance(launch: Optional[tuple[Path, Path]] = Non
         release_or_close(_adb)
 
 
+def _housekeeping_private_media() -> None:
+    """Collect expired private orphans during idle periods, per served profile."""
+    from gateway.session_shared_media_private import private_root, sweep_private
+    if not private_root().exists():
+        return
+    from hermes_state_registry import acquire, release_or_close
+    db = acquire()
+    try:
+        try:
+            sweep_private(db, blocking=False)
+        except BlockingIOError:
+            pass  # a capture owns the lock; retry on the next tick
+    finally:
+        release_or_close(db)
+
+
 def _housekeeping_deferred_fts_retry() -> None:
     """A SessionDB opened while another process held the rebuild lock fails closed onto the LIKE fallback
     and the gateway stays up for days. Non-blocking, rate-limited inside SessionDB; no-op when not stale."""
@@ -4530,6 +4546,7 @@ def _start_gateway_housekeeping(
         # Per served profile: each profile has its own skills tree, curator state, Nous login
         # and state.db.
         (60, "Curator tick", profile_scoped_chore(runner, _housekeeping_curator)),
+        (60, "Private media retention", profile_scoped_chore(runner, _housekeeping_private_media)),
         (60, "state.db maintenance tick", profile_scoped_chore(
             runner,
             # Default-bound now, i.e. OUTSIDE any profile scope: this is the launch home's override.

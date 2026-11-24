@@ -37,7 +37,7 @@ def is_private_path(path):
 
 
 @contextmanager
-def private_store():
+def private_store(*, blocking=True):
     import fcntl
     root = private_root()
     make_user_dir(root, mode=0o700, parents=True, exist_ok=True)
@@ -49,7 +49,7 @@ def private_store():
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
             raise OSError('unsafe private media lock')
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        fcntl.flock(fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
         _held.root = root
         try:
             yield root
@@ -182,11 +182,11 @@ def recover_private(root, db, *, older_than):
     return db._execute_write(collect)
 
 
-def sweep_private(db):
+def sweep_private(db, *, blocking=True):
     """Sweep an existing namespace without creating one for unrelated profiles."""
     import time
     from agent.provider_media import MEDIA_CACHE_MAX_AGE_HOURS
     if not private_root().exists():
         return 0
-    with private_store() as root:
+    with private_store(blocking=blocking) as root:
         return recover_private(root, db, older_than=time.time() - MEDIA_CACHE_MAX_AGE_HOURS * 3600)

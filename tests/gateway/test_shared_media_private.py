@@ -280,3 +280,33 @@ with private_store() as root:
             if process is not None and process.poll() is None:
                 process.kill()
                 process.wait(timeout=10)
+
+
+def test_idle_housekeeping_skips_live_lock_then_collects(tmp_path, monkeypatch):
+    import agent.provider_media as provider_media
+    import hermes_state_registry
+    from gateway.run import _housekeeping_private_media
+    from gateway.session_shared_media_private import private_store, capture_private
+    from hermes_state import SessionDB
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.setattr(provider_media, 'MEDIA_CACHE_MAX_AGE_HOURS', 0)
+    db = SessionDB(db_path=tmp_path / 'state.db')
+    monkeypatch.setattr(hermes_state_registry, 'acquire', lambda: db)
+    monkeypatch.setattr(hermes_state_registry, 'release_or_close', lambda _db: None)
+    with private_store() as root:
+        orphan = capture_private(root, 'idle.txt', b'idle')
+    code = ("import time; from gateway.session_shared_media_private import private_store; "
+            "ctx=private_store(); ctx.__enter__(); print('locked',flush=True); time.sleep(30)")
+    proc = subprocess.Popen([sys.executable, '-c', code], env=dict(os.environ), stdout=subprocess.PIPE, text=True)
+    try:
+        assert proc.stdout is not None and proc.stdout.readline().strip() == 'locked'
+        _housekeeping_private_media()
+        assert Path(orphan['path']).exists()
+        proc.kill()
+        assert proc.wait(timeout=10) == -signal.SIGKILL
+        _housekeeping_private_media()
+        assert not Path(orphan['path']).exists()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
