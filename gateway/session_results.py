@@ -63,7 +63,8 @@ def prepare_result(row, response, outcome, result=None):
     return outcome, _redacted(compact_result(result, user_message=row['payload'].get('text')))
 
 
-def finish_result(db, *, epoch, row, response, outcome, result=None, prepared=None, transfers=None):
+def finish_result(db, *, epoch, row, response, outcome, result=None, prepared=None, transfers=None,
+                  route=None, profile_id=None):
     """Delivery failure cannot rewrite an already committed execution outcome.
 
     `result` is the exact structured result captured in-process; the managed
@@ -95,11 +96,18 @@ def finish_result(db, *, epoch, row, response, outcome, result=None, prepared=No
     notice, display_metadata = owner_stop_notice(result, outcome, row), None
     if notice is None and (refusal := gateway_refusal_boundary(result, outcome)) is not None:
         notice, display_metadata = refusal
-    write = None if notice is None else (lambda conn, _current: close_discarded_turn(
-        db, conn, row, notice, replace_after=row.get('transcript_mark'), display_metadata=display_metadata))
+    from gateway.session_settlement_extensions import required_extensions, write_extensions
+    callbacks = required_extensions(db, profile_id)
+    def write(conn, _current):
+        if notice is not None:
+            close_discarded_turn(db, conn, row, notice, replace_after=row.get('transcript_mark'),
+                                 display_metadata=display_metadata)
+        write_extensions(db, callbacks, conn, row=row, route=route, response=response, outcome=outcome,
+                         result=result, profile_id=profile_id)
+    terminal_write = write if notice is not None or callbacks else None
     settled = settle_session_input(db, epoch=epoch, admission_id=row['admission_id'],
         generation=row['generation'], outcome=outcome, result=stored, _transfers=transfers,
-        _terminal_write=write)
+        _terminal_write=terminal_write)
     return settled, response
 
 

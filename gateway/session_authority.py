@@ -828,14 +828,24 @@ class SessionAuthority:
         # claimed with the discarded text left open to be merged into its request. With a captured
         # result the answer is normally already the transcript tail, so the closer is a no-op.
         from gateway.session_results import close_discarded_turn
+        from gateway.session_settlement_extensions import required_extensions, write_extensions
+        live_route = self.sessions[ref.session_id].route
+        answer = (captured or {}).get('result') or {}
+        callbacks = (await asyncio.to_thread(required_extensions, self.db, self.profile_id)
+                     if before is not None and before['status'] == 'unknown' else ())
+        def terminal_write(conn, lost):
+            same_owner = prepared is not None and lost['owner_epoch'] == self.epoch
+            close_discarded_turn(self.db, conn, lost, None if same_owner else notice)
+            write_extensions(self.db, callbacks, conn, row=before, route=live_route,
+                             response=(answer.get('final_response') or '') if same_owner else '',
+                             outcome=prepared[0] if same_owner else 'interrupted',
+                             result=captured if same_owner else None, profile_id=self.profile_id)
         from gateway.session_runtime_workers import tracked_write
         return await tracked_write(self, partial(
             resolve_unknown_session_input, self.db, epoch=self.epoch, admission_id=admission_id,
             generation=generation, _captured=prepared,
-            # ``notice`` says the turn was interrupted: only when that is the outcome, never beside a
-            # captured result this resolution commits as the turn's own answer.
-            _terminal_write=lambda conn, lost: close_discarded_turn(self.db, conn, lost, None if (
-                prepared is not None and lost['owner_epoch'] == self.epoch) else notice)),
+            # The captured result and its outbox record commit in the same resolution transaction.
+            _terminal_write=terminal_write),
             then=partial(self._resolved_unknown, ref, admission_id, prepared, captured))
 
     async def _resolved_unknown(self, ref, admission_id, prepared, captured, row):
@@ -1383,12 +1393,16 @@ async def initialize_session_authority(runner, *, profile_id, instance_id, db=No
     # yielding, so no other task observes a half-registered authority.
     from pathlib import Path
     db_key = await asyncio.to_thread(Path(db.db_path).resolve)
+    # Refuse a broken required extension before rotating the owner epoch or recovering
+    # any turns. Settlement checks again so later unload/config changes fail closed too.
+    from gateway.session_settlement_extensions import required_extensions
+    await asyncio.to_thread(required_extensions, db, profile_id)
     epoch = await asyncio.to_thread(begin_runtime_epoch, db, instance_id=instance_id)
     # Hot-serve builds a profile while the loop serves the others: both writes stay off it.
     await asyncio.to_thread(recover_session_inputs, db, epoch=epoch)
     # A lost automation turn has nobody to resolve it: it settles interrupted before any FIFO runs.
     from gateway.session_unattended_unknown import settle_recovered_unattended
-    await asyncio.to_thread(settle_recovered_unattended, db, epoch)
+    await asyncio.to_thread(settle_recovered_unattended, db, epoch, profile_id=profile_id)
     await asyncio.to_thread(backfill_legacy_session_owners, db)
     await asyncio.to_thread(backfill_compression_created_sources, db)
     authority = SessionAuthority(runner, profile_id=profile_id, instance_id=instance_id, db=db, epoch=epoch)

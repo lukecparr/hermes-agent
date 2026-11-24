@@ -2097,6 +2097,10 @@ DEFAULT_CONFIG = {
         "export": {"otlp": {"enabled": False, "endpoint": "", "headers_env": {}}},
     },
     "gateway": {  # Gateway settings (messaging platforms: Telegram, Discord, Slack, ...).
+        # Trusted in-process plugins whose transaction writers must be present for turn settlement.
+        "required_settlement_plugins": [],
+        # Best-effort writers: failed callbacks roll back their own writes and drop the event.
+        "optional_settlement_plugins": [],
         "unmanaged_idle_exit_seconds": 600,  # client-auto-started gateway only; 0 disables
         # Seconds a SIGTERM-interrupted agent unwinds before teardown (short: service stop budgets).
         "signal_interrupt_grace_timeout": 1,

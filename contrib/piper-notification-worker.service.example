@@ -1,0 +1,21 @@
+# Example only. Not installed or enabled by this repository.
+# Copy and adapt paths only after security review and explicit deployment approval.
+# EnvironmentFile must be owner-readable only and define PIPER_COMPLETION_URL,
+# PIPER_COMPLETION_TOKEN and PIPER_COMPLETION_DATABASE (no values in this file).
+[Unit]
+Description=Experimental Piper completion outbox sender
+After=network-online.target
+ConditionPathExists=%h/.config/piper/turn-push-worker.enabled
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Projects/hermes-agent
+EnvironmentFile=%h/.config/piper/turn-push-worker.env
+ExecStart=/usr/bin/python3 %h/Projects/hermes-agent/scripts/piper_completion_worker.py --database ${PIPER_COMPLETION_DATABASE}
+Restart=on-failure
+RestartSec=15s
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+
+# Deliberately no [Install] section; manual review is required before activation.
