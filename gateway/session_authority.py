@@ -828,16 +828,18 @@ class SessionAuthority:
         # claimed with the discarded text left open to be merged into its request. With a captured
         # result the answer is normally already the transcript tail, so the closer is a no-op.
         from gateway.session_results import close_discarded_turn
-        from gateway.piper_turn_outbox import eligible_turn, insert_completion
+        from gateway.session_settlement_extensions import required_extensions, write_extensions
         live_route = self.sessions[ref.session_id].route
         answer = (captured or {}).get('result') or {}
-        turn_id = (eligible_turn(before, live_route, answer.get('final_response'), prepared[0])
-                   if prepared is not None and answer.get('completed') is True else None)
+        callbacks = (await asyncio.to_thread(required_extensions, self.db, self.profile_id)
+                     if prepared is not None and before['owner_epoch'] == self.epoch else ())
         def terminal_write(conn, lost):
             same_owner = prepared is not None and lost['owner_epoch'] == self.epoch
             close_discarded_turn(self.db, conn, lost, None if same_owner else notice)
-            if same_owner and turn_id is not None:
-                insert_completion(conn, admission_id, turn_id)
+            if same_owner:
+                write_extensions(self.db, callbacks, conn, row=before, route=live_route,
+                                 response=answer.get('final_response') or '', outcome=prepared[0], result=captured,
+                                 profile_id=self.profile_id)
         from gateway.session_runtime_workers import tracked_write
         return await tracked_write(self, partial(
             resolve_unknown_session_input, self.db, epoch=self.epoch, admission_id=admission_id,

@@ -940,6 +940,21 @@ class PluginContext:
                 logger.warning("Plugin '%s' locale file %s skipped: %s", self.manifest.name, file, exc)
         return handles
 
+    @_serialized_replacement
+    def register_settlement_extension(self, callback: Callable) -> PluginRegistration:
+        """Register this plugin's synchronous, transaction-bound settlement writer.
+
+        This trusted in-process callback must only write using the supplied connection, never
+        commit, roll back, perform I/O, or retain it. Exceptions abort the whole settlement.
+        """
+        if not callable(callback):
+            raise TypeError('settlement extension must be callable')
+        key = self.plugin_id
+        if key in self._manager._settlement_extensions:
+            raise ValueError(f'settlement extension already registered: {key}')
+        return self._track_mapping_entry('settlement_extension', key,
+                                         self._manager._settlement_extensions, callback)
+
     def register_hook(self, hook_name: str, callback: Callable) -> PluginRegistration:
         """Register a lifecycle hook callback (unknown names warn but are still stored)."""
         return self._track_callback("hook", hook_name, callback, self._manager._hooks, VALID_HOOKS)
@@ -1136,6 +1151,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         # (matcher, callback, plugin_name), platform handler factories (lowercase platform -> list).
         self._plugins: dict[str, LoadedPlugin] = {}
         self._hooks: dict[str, list[Callable]] = {}
+        self._settlement_extensions: dict[str, Callable] = {}
         # Fallback hooks registered by a memory provider before general discovery.
         self._memory_hook_registrations: dict[tuple[str, str], list[PluginRegistration]] = {}
         self._middleware: dict[str, list[Callable]] = {}

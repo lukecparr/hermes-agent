@@ -16,6 +16,18 @@ def isolate_stop_notice(monkeypatch):
     # Avoid importing the live install bootstrap through owner_stop_notice.
     import gateway.session_settlement_recovery as settlement
     monkeypatch.setattr(settlement, 'owner_stop_notice', lambda *_args: None)
+    import os
+    import gateway.session_settlement_extensions as extensions
+    import gateway.piper_turn_outbox as outbox
+    def callbacks(_db, _profile_id=None):
+        def write(*, conn, row, route, response, outcome, result):
+            completed = ((result or {}).get('result') or {}).get('completed') is True
+            turn_id = outbox.eligible_turn(row, route, response, outcome,
+                                           configured=os.environ.get('PIPER_TURN_OUTBOX_ROUTE')) if completed else None
+            if turn_id:
+                outbox.insert_completion(conn, row['admission_id'], turn_id)
+        return (write,)
+    monkeypatch.setattr(extensions, 'required_extensions', callbacks)
 
 
 def claim(owner, *, turn=TURN, principal=None, producer='piper-shared-thread'):
@@ -31,7 +43,7 @@ def claim(owner, *, turn=TURN, principal=None, producer='piper-shared-thread'):
 def finish(owner, row, response='private answer', outcome='completed', route=ROUTE):
     return finish_result(owner.db, epoch=owner.epoch, row=row, response=response, outcome=outcome,
                          result={'result': {'final_response': response, 'messages': [], 'completed': True}, 'usage': {}},
-                         piper_route=route)
+                         route=route)
 
 
 def events(owner):
@@ -106,7 +118,7 @@ def test_a_gateway_notice_without_an_agent_result_is_not_a_reply(owner, monkeypa
     monkeypatch.setenv('PIPER_TURN_OUTBOX_ROUTE', ROUTE)
     row = claim(owner)
     finish_result(owner.db, epoch=owner.epoch, row=row, response='gateway notice', outcome='completed',
-                  piper_route=ROUTE)
+                  route=ROUTE)
     assert events(owner) == []
 
 

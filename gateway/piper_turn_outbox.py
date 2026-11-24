@@ -4,7 +4,6 @@ This is a local outbox only: it does not send notifications or expose a network 
 The owner inserts inside the same transaction as its ordinary terminal settlement.
 """
 import json
-import os
 import re
 
 from gateway.response_filters import is_intentional_silence_response
@@ -15,9 +14,8 @@ from gateway.response_filters import is_intentional_silence_response
 _ID = re.compile(r'^web-[A-Za-z0-9_-]{16,60}$')
 
 
-def eligible_turn(row, route, response, outcome):
+def eligible_turn(row, route, response, outcome, *, configured=None):
     """Return the web turn id only for a completed, non-silent shared-thread reply."""
-    configured = os.environ.get('PIPER_TURN_OUTBOX_ROUTE')
     if not configured or route != configured or row.get('principal_id') != 'automation:' + route:
         return None
     if outcome != 'completed' or not isinstance(response, str) or not response.strip():
