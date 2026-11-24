@@ -7,6 +7,7 @@ from copy import deepcopy
 from datetime import UTC, datetime
 import json
 import logging
+import os
 import re
 
 from gateway.config import Platform
@@ -16,8 +17,9 @@ from hermes_state_runtime import RuntimeStoreError, admit_session_input, list_se
 
 logger = logging.getLogger(__name__)
 
-# The shared-thread plugin uses this explicit contract to gate browser uploads.
-SHARED_THREAD_MEDIA_V1 = False  # fail closed until orphan recovery is verified
+# Process-wide startup opt-in. Only the literal "1" enables the plugin contract;
+# absent, malformed and truthy-looking values fail closed. Restart to change it.
+SHARED_THREAD_MEDIA_V1 = os.environ.get('HERMES_SHARED_THREAD_MEDIA_V1') == '1'
 
 
 def producer_identity(runner, event):
