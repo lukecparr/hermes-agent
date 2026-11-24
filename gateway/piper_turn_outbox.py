@@ -9,7 +9,10 @@ import re
 
 from gateway.response_filters import is_intentional_silence_response
 
-_ID = re.compile(r'^[A-Za-z0-9_-]{8,64}$')
+# Match the Second Brain web admission and completion-receiver contract exactly.
+# The plugin accepts a broader ID for other surfaces; those IDs cannot be sent
+# to this receiver without permanently blocking the outbox on a 400 response.
+_ID = re.compile(r'^web-[A-Za-z0-9_-]{16,60}$')
 
 
 def eligible_turn(row, route, response, outcome):

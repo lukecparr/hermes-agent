@@ -68,6 +68,23 @@ def test_no_ineligible_events(owner, monkeypatch, scenario):
     assert events(owner) == []
 
 
+@pytest.mark.parametrize('turn', ['abcdefgh', 'web-' + 'a' * 15, 'web-' + 'a' * 61, 'web-' + 'a' * 15 + '.'])
+def test_receiver_incompatible_web_ids_never_enter_outbox(owner, monkeypatch, turn):
+    monkeypatch.setenv('PIPER_TURN_OUTBOX_ROUTE', ROUTE)
+    row = claim(owner, turn=turn)
+    finish(owner, row)
+    assert events(owner) == []
+
+
+@pytest.mark.parametrize('size', [16, 60])
+def test_web_id_contract_boundaries_are_deliverable(owner, monkeypatch, size):
+    monkeypatch.setenv('PIPER_TURN_OUTBOX_ROUTE', ROUTE)
+    turn = 'web-' + 'a' * size
+    row = claim(owner, turn=turn)
+    finish(owner, row)
+    assert events(owner) == [(row['admission_id'], turn, 'piper.turn.completed.v1')]
+
+
 def test_authority_commit_path_passes_live_route(owner, monkeypatch):
     from threading import RLock
     from types import SimpleNamespace
