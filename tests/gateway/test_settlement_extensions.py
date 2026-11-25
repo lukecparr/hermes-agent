@@ -112,7 +112,7 @@ def test_callback_uses_database_owner_profile(owner, tmp_path, monkeypatch):
         assert Path(conn.execute('SELECT home FROM scope_probe').fetchone()[0]) == profile
 
 
-def test_reload_refreshes_writer_and_unload_fails_closed(owner, tmp_path, monkeypatch):
+def test_reload_refreshes_writer_and_unload_is_best_effort(owner, tmp_path, monkeypatch):
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
     from hermes_cli.plugins import get_plugin_manager
     from gateway.session_settlement_extensions import required_extensions, write_extensions
@@ -142,37 +142,32 @@ def test_reload_refreshes_writer_and_unload_fails_closed(owner, tmp_path, monkey
         with owner.db._read_ctx() as conn:
             assert [r[0] for r in conn.execute('SELECT version FROM reload_probe')] == ['first', 'second-version']
         assert manager.unload('piper-turn-outbox')
-        with pytest.raises(RuntimeError, match='required settlement plugin unavailable'):
-            required_extensions(owner.db, str(tmp_path))
+        assert required_extensions(owner.db, str(tmp_path)) == ()
     finally:
         reset_hermes_home_override(token)
 
 
-def test_host_isolation_cannot_register_required_extension(owner, tmp_path, monkeypatch):
+def test_host_isolation_missing_writer_does_not_block_chat(owner, tmp_path, monkeypatch):
     import gateway.session_settlement_recovery as recovery
     monkeypatch.setattr(recovery, 'owner_stop_notice', lambda *_: None)
     setup_config(tmp_path)
     config = tmp_path / 'config.yaml'
     config.write_text(config.read_text().replace('plugins:\n', 'plugins:\n  isolation: host\n'))
     row = claim(owner)
-    with pytest.raises(RuntimeError, match='required settlement plugin unavailable'):
-        finish(owner, row)
-    assert get_session_admission(owner.db, admission_id=row['admission_id'])['status'] == 'started'
+    finish(owner, row)
+    assert get_session_admission(owner.db, admission_id=row['admission_id'])['outcome'] == 'completed'
 
 
 @pytest.mark.asyncio
-async def test_startup_missing_plugin_does_not_fence_existing_owner(owner, tmp_path):
+async def test_startup_missing_writer_does_not_block_recovery(owner, tmp_path):
     from gateway.session_authority import initialize_session_authority
     from hermes_state_runtime import settle_session_input
     setup_config(tmp_path, install=False)
     row = claim(owner)
-    with pytest.raises(RuntimeError, match='required settlement plugin unavailable'):
-        await initialize_session_authority(owner.runner, profile_id=str(tmp_path), instance_id='new-owner',
-                                           db=owner.db, register=False)
-    # The old owner can still complete under its original epoch: startup refused before rotating it.
-    settled = settle_session_input(owner.db, epoch=owner.epoch, admission_id=row['admission_id'],
-                                   generation=row['generation'], outcome='failed')
-    assert settled['outcome'] == 'failed'
+    replacement = await initialize_session_authority(owner.runner, profile_id=str(tmp_path), instance_id='new-owner',
+                                                     db=owner.db, register=False)
+    assert replacement.epoch != owner.epoch
+    assert get_session_admission(owner.db, admission_id=row['admission_id'])['status'] in {'unknown', 'terminal'}
 
 
 @pytest.mark.asyncio
@@ -201,7 +196,7 @@ async def test_discard_unknown_invokes_required_writer_with_interrupted_outcome(
         assert tuple(conn.execute('SELECT * FROM audit').fetchone()) == (row['admission_id'], ROUTE, 'interrupted')
 
 
-def test_boot_interruption_writer_failure_rolls_back(owner, tmp_path):
+def test_boot_interruption_writer_failure_drops_only_writer(owner, tmp_path):
     from gateway.session_unattended_unknown import settle_recovered_unattended
     from hermes_state_runtime import begin_runtime_epoch, recover_session_inputs
     setup_config(tmp_path)
@@ -216,9 +211,8 @@ def test_boot_interruption_writer_failure_rolls_back(owner, tmp_path):
     row = claim(owner)
     epoch = begin_runtime_epoch(owner.db, instance_id='restarted')
     recover_session_inputs(owner.db, epoch=epoch)
-    with pytest.raises(RuntimeError, match='audit failed'):
-        settle_recovered_unattended(owner.db, epoch, profile_id=str(tmp_path))
-    assert get_session_admission(owner.db, admission_id=row['admission_id'])['status'] == 'unknown'
+    assert settle_recovered_unattended(owner.db, epoch, profile_id=str(tmp_path)) == 1
+    assert get_session_admission(owner.db, admission_id=row['admission_id'])['outcome'] == 'interrupted'
     with owner.db._read_ctx() as conn:
         assert conn.execute("SELECT 1 FROM sqlite_master WHERE name='audit'").fetchone() is None
 
@@ -242,14 +236,13 @@ def test_restart_loses_uncommitted_capture_and_does_not_invent_completion(owner,
         assert conn.execute("SELECT 1 FROM sqlite_master WHERE name='piper_turn_outbox'").fetchone() is None
 
 
-def test_missing_required_plugin_refuses_settlement(owner, tmp_path, monkeypatch):
+def test_missing_required_plugin_does_not_block_settlement(owner, tmp_path, monkeypatch):
     import gateway.session_settlement_recovery as recovery
     monkeypatch.setattr(recovery, 'owner_stop_notice', lambda *_: None)
     setup_config(tmp_path, install=False)
     row = claim(owner)
-    with pytest.raises(RuntimeError, match='required settlement plugin unavailable'):
-        finish(owner, row)
-    assert get_session_admission(owner.db, admission_id=row['admission_id'])['status'] == 'started'
+    finish(owner, row)
+    assert get_session_admission(owner.db, admission_id=row['admission_id'])['outcome'] == 'completed'
 
 
 @pytest.mark.parametrize('source', [
@@ -257,15 +250,14 @@ def test_missing_required_plugin_refuses_settlement(owner, tmp_path, monkeypatch
     'def register(ctx):\n    ctx.register_settlement_extension(lambda **kw: None)\n    raise ValueError("broken")\n',
     'def register(ctx):\n    ctx.register_settlement_extension(None)\n',
 ])
-def test_failed_or_missing_registration_fails_closed(owner, tmp_path, monkeypatch, source):
+def test_failed_or_missing_registration_does_not_block_settlement(owner, tmp_path, monkeypatch, source):
     import gateway.session_settlement_recovery as recovery
     monkeypatch.setattr(recovery, 'owner_stop_notice', lambda *_: None)
     setup_config(tmp_path)
     (tmp_path / 'plugins' / 'piper-turn-outbox' / '__init__.py').write_text(source)
     row = claim(owner)
-    with pytest.raises(RuntimeError, match='required settlement plugin unavailable'):
-        finish(owner, row)
-    assert get_session_admission(owner.db, admission_id=row['admission_id'])['status'] == 'started'
+    finish(owner, row)
+    assert get_session_admission(owner.db, admission_id=row['admission_id'])['outcome'] == 'completed'
 
 
 @pytest.mark.asyncio
@@ -293,7 +285,7 @@ async def test_real_plugin_captured_recovery(owner, tmp_path, monkeypatch):
 
 @pytest.mark.parametrize('resolution', ['normal', 'captured'])
 @pytest.mark.asyncio
-async def test_real_plugin_write_failure_rolls_back(owner, tmp_path, monkeypatch, resolution):
+async def test_real_plugin_write_failure_drops_only_writer(owner, tmp_path, monkeypatch, resolution):
     import gateway.session_settlement_recovery as recovery
     from gateway.session_authority import LiveSession
     from gateway.session_contract import Principal, SessionRef
@@ -308,9 +300,7 @@ async def test_real_plugin_write_failure_rolls_back(owner, tmp_path, monkeypatch
         '    ctx.register_settlement_extension(write)\n')
     row = claim(owner)
     if resolution == 'normal':
-        with pytest.raises(RuntimeError, match='write failed'):
-            finish(owner, row)
-        expected = 'started'
+        finish(owner, row)
     else:
         owner.sessions[TURN] = LiveSession(None, ROUTE)
         owner.pending_results[row['admission_id']] = {
@@ -318,16 +308,14 @@ async def test_real_plugin_write_failure_rolls_back(owner, tmp_path, monkeypatch
         owner.db._execute_write(lambda conn: conn.execute(
             "UPDATE session_admissions SET status='unknown' WHERE admission_id=?", (row['admission_id'],)))
         actor = Principal('human', owner.profile_id, frozenset({'session:control', 'session:submit'}), 'test')
-        with pytest.raises(RuntimeError, match='write failed'):
-            await owner.resolve_unknown(actor, SessionRef(owner.profile_id, TURN), row['admission_id'], row['generation'])
-        expected = 'unknown'
-    assert get_session_admission(owner.db, admission_id=row['admission_id'])['status'] == expected
+        await owner.resolve_unknown(actor, SessionRef(owner.profile_id, TURN), row['admission_id'], row['generation'])
+    assert get_session_admission(owner.db, admission_id=row['admission_id'])['outcome'] == 'completed'
     with owner.db._read_ctx() as conn:
         assert conn.execute("SELECT 1 FROM sqlite_master WHERE name='probe'").fetchone() is None
 
 
 @pytest.mark.asyncio
-async def test_missing_plugin_fences_captured_recovery(owner, tmp_path, monkeypatch):
+async def test_missing_plugin_allows_captured_recovery(owner, tmp_path, monkeypatch):
     from gateway.session_authority import LiveSession
     from gateway.session_contract import Principal, SessionRef
     setup_config(tmp_path, install=False)
@@ -339,6 +327,5 @@ async def test_missing_plugin_fences_captured_recovery(owner, tmp_path, monkeypa
         "UPDATE session_admissions SET status='unknown' WHERE admission_id=?", (row['admission_id'],)))
     actor = Principal('human', owner.profile_id, frozenset({'session:control', 'session:submit'}), 'test')
     ref = SessionRef(owner.profile_id, TURN)
-    with pytest.raises(RuntimeError, match='required settlement plugin unavailable'):
-        await owner.resolve_unknown(actor, ref, row['admission_id'], row['generation'])
-    assert get_session_admission(owner.db, admission_id=row['admission_id'])['status'] == 'unknown'
+    await owner.resolve_unknown(actor, ref, row['admission_id'], row['generation'])
+    assert get_session_admission(owner.db, admission_id=row['admission_id'])['outcome'] == 'completed'

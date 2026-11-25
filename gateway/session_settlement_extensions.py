@@ -26,10 +26,10 @@ def profile_home(db, profile_id=None):
 
 
 def required_extensions(db, profile_id=None):
-    """Resolve required plugins before the SQLite write; missing registrations fail closed.
+    """Resolve settlement plugins as best-effort observers of committed turns.
 
-    Snapshot callbacks for this settlement: unloading a plugin later cannot remove an already
-    started write. Discovery and config always use the database owner's profile, not ambient scope.
+    The old required setting is accepted for compatibility, but cannot make an
+    optional notification failure block conversation settlement or startup.
     """
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
     from hermes_cli.config_effective import load_user_config_effective
@@ -56,19 +56,11 @@ def required_extensions(db, profile_id=None):
             discover_plugins()
             manager = get_plugin_manager()
         except Exception:
-            if names:
-                raise
-            logger.error('Optional settlement plugins unavailable; notifications may be dropped')
+            logger.error('Settlement plugins unavailable; notifications may be dropped')
             return ()
         with manager._discovery_lock:
             callbacks = []
-            for name in names:
-                plugin = manager._plugins.get(name)
-                callback = manager._settlement_extensions.get(name)
-                if plugin is None or not plugin.enabled or plugin.error or callback is None:
-                    raise RuntimeError(f'required settlement plugin unavailable: {name}')
-                callbacks.append(callback)
-            for name in optional:
+            for name in (*names, *optional):
                 plugin = manager._plugins.get(name)
                 callback = manager._settlement_extensions.get(name)
                 if plugin is None or not plugin.enabled or plugin.error or callback is None:

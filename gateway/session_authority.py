@@ -1393,8 +1393,8 @@ async def initialize_session_authority(runner, *, profile_id, instance_id, db=No
     # yielding, so no other task observes a half-registered authority.
     from pathlib import Path
     db_key = await asyncio.to_thread(Path(db.db_path).resolve)
-    # Refuse a broken required extension before rotating the owner epoch or recovering
-    # any turns. Settlement checks again so later unload/config changes fail closed too.
+    # Validate the extension config before rotating the owner epoch. Plugin availability
+    # itself is best-effort so a broken notification writer cannot prevent normal chat.
     from gateway.session_settlement_extensions import required_extensions
     await asyncio.to_thread(required_extensions, db, profile_id)
     epoch = await asyncio.to_thread(begin_runtime_epoch, db, instance_id=instance_id)
