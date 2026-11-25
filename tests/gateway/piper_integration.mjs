@@ -24,9 +24,10 @@ async function availablePort() {
   return port;
 }
 try {
-  for (const recovery of [false, true]) {
+  for (const mode of ["normal", "recovery", "retry", "local-wake"]) {
+    const recovery = mode === "recovery";
     const {mkdir} = await import('node:fs/promises');
-    const home = join(temp, recovery ? 'recovery' : 'normal');
+    const home = join(temp, mode);
     await mkdir(home);
     const db = new PGlite();
     await db.exec(`CREATE TABLE device_tokens (id TEXT PRIMARY KEY, "fcmToken" TEXT UNIQUE NOT NULL,
@@ -34,7 +35,7 @@ try {
       "lastActive" TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, "createdAt" TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
       "updatedAt" TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP);`);
     for (const migration of ['20261123000000_piper_completion_inbox', '20261123000002_piper_delivery_terminal_at',
-                             '20261123000003_piper_registration_fence']) {
+                             '20261123000003_piper_registration_fence', '20261125000000_piper_reply_preview']) {
       await db.exec(await readFile(join(sb, 'data/prisma/migrations', migration, 'migration.sql'), 'utf8'));
     }
     const port = await availablePort();
@@ -43,7 +44,10 @@ try {
     try {
       const env = {PATH:process.env.PATH, HOME:home, TMPDIR:home, HERMES_HOME:home,
         HERMES_RUNTIME_DIR:join(home, 'runtime'), PIPER_TEST_PYTHON:python,
+        ...(process.env.PIPER_TEST_PYTHONPATH ? {PYTHONPATH:process.env.PIPER_TEST_PYTHONPATH} : {}),
         PIPER_TEST_SB_REPO:sb, PIPER_TEST_HERMES_REPO:repo, PIPER_TEST_RECOVERY:recovery ? '1' : '0',
+        PIPER_TEST_RETRY:mode === 'retry' ? '1' : '0', PIPER_TEST_LOCAL_WAKE:mode === 'local-wake' ? '1' : '0',
+        PIPER_PUSH_DISPATCH:mode === 'local-wake' ? '0' : '1',
         POSTGRES_URL:`postgresql://postgres:postgres@127.0.0.1:${port}/postgres?sslmode=disable&connection_limit=1&pgbouncer=true`,
         PIPER_PUSH_RECEIVER:'1', PIPER_PUSH_INGEST_TOKEN:'x'.repeat(32)};
       const child = spawn(join(sb, 'node_modules/.bin/tsx'), ['--tsconfig', join(sb, 'tsconfig.json'),

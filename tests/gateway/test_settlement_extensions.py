@@ -36,6 +36,63 @@ def finish(owner, row):
                          route=ROUTE, profile_id=owner.profile_id)
 
 
+@pytest.mark.asyncio
+async def test_streamed_reply_uses_captured_answer_not_adapter_return(owner, tmp_path, monkeypatch):
+    """Real delivery suppression + discovery + transaction, without route/ID conflation."""
+    from types import SimpleNamespace
+    from gateway.run_turn_persistence import GatewayTurnPersistenceMixin
+    import gateway.session_settlement_recovery as recovery
+    monkeypatch.setattr(recovery, 'owner_stop_notice', lambda *_: None)
+    setup_config(tmp_path, optional=True)
+    sid = 'fixture-physical-session'
+    owner.db.create_session(sid, source='telegram')
+    admitted = admit_session_input(
+        owner.db, epoch=owner.epoch, principal_id='automation:' + ROUTE,
+        session_id=sid, request_id=json.dumps(['piper-shared-thread', 'second-brain-web', TURN]),
+        payload={'text': 'fixture question'})
+    row = claim_session_input(owner.db, epoch=owner.epoch, session_id=sid)
+    result = {'completed': True, 'final_response': 'fixture answer', 'messages': [],
+              'already_sent': True, '_notification_reply_muted': False}
+    runner = SimpleNamespace(_delivery_adapter_for=lambda _: None,
+                             _should_send_voice_reply=lambda *a, **kw: False)
+    event = SimpleNamespace(metadata={}, _notification_reply_muted=False)
+    response = await GatewayTurnPersistenceMixin._hmwa_deliver_turn_response(
+        runner, event, None, SimpleNamespace(session_id=sid), ROUTE, 1,
+        result, [], result['final_response'], None, False)
+    assert response is None  # Stream delivered it; the adapter must not send it twice.
+    kwargs = dict(epoch=owner.epoch, row=row, response=response, outcome='completed',
+                  result={'result': result}, route=ROUTE, profile_id=owner.profile_id)
+    finish_result(owner.db, **kwargs)
+    finish_result(owner.db, **kwargs)  # Exact retry cannot duplicate it or rewrite admission identity.
+    assert get_session_admission(owner.db, admission_id=admitted['admission_id'])['target_session_id'] == sid
+    with owner.db._read_ctx() as conn:
+        assert [tuple(r) for r in conn.execute('SELECT admission_id, turn_id FROM piper_turn_outbox')] == [
+            (row['admission_id'], TURN)]
+
+
+@pytest.mark.parametrize('response, changes, route', [
+    (None, {'already_sent': False}, ROUTE),
+    ('', {}, ROUTE),  # Explicitly suppressed output must stay suppressed.
+    (None, {'final_response': '[SILENT]'}, ROUTE),
+    (None, {'final_response': ''}, ROUTE),
+    (None, {'completed': False}, ROUTE),
+    (None, {'_notification_reply_muted': True}, ROUTE),
+    ('answer', {'_notification_reply_muted': True}, ROUTE),
+    (None, {}, 'different-route'),
+])
+def test_stream_fallback_does_not_invent_notifications(owner, tmp_path, monkeypatch, response, changes, route):
+    import gateway.session_settlement_recovery as recovery
+    monkeypatch.setattr(recovery, 'owner_stop_notice', lambda *_: None)
+    setup_config(tmp_path, optional=True)
+    row = claim(owner)
+    finish_result(owner.db, epoch=owner.epoch, row=row, response=response, outcome='completed',
+                  result={'result': {'completed': True, 'final_response': 'answer', 'messages': [],
+                                     'already_sent': True, **changes}},
+                  route=route, profile_id=owner.profile_id)
+    with owner.db._read_ctx() as conn:
+        assert conn.execute("SELECT 1 FROM sqlite_master WHERE name='piper_turn_outbox'").fetchone() is None
+
+
 def test_real_plugin_discovery_writes_with_settlement(owner, tmp_path, monkeypatch):
     import gateway.session_settlement_recovery as recovery
     monkeypatch.setattr(recovery, 'owner_stop_notice', lambda *_: None)
