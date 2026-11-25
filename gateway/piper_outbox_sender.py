@@ -30,7 +30,7 @@ def validate_config(url, token):
         raise ValueError('invalid credential')
 
 
-def claim(conn, now, lease_seconds=120):
+def claim(conn, now, lease_seconds=120, *, include_preview=False):
     """Lease one due row; a dead process's lease becomes eligible after expiry."""
     conn.execute('BEGIN IMMEDIATE')
     try:
@@ -40,7 +40,9 @@ def claim(conn, now, lease_seconds=120):
             conn.commit()
             return None
         ensure_terminal_column(conn)
-        row = conn.execute('''SELECT admission_id,turn_id,event_type,attempts FROM piper_turn_outbox
+        columns = {r[1] for r in conn.execute('PRAGMA table_info(piper_turn_outbox)')}
+        preview_sql = 'preview' if include_preview and 'preview' in columns else 'NULL'
+        row = conn.execute(f'''SELECT admission_id,turn_id,event_type,attempts,{preview_sql} FROM piper_turn_outbox
             WHERE (state='pending' AND next_attempt<=?) OR (state='leased' AND lease_until<=?)
             ORDER BY created_at,admission_id LIMIT 1''', (now, now)).fetchone()
         if row is None:
@@ -50,14 +52,20 @@ def claim(conn, now, lease_seconds=120):
         conn.execute("UPDATE piper_turn_outbox SET state='leased',lease_token=?,lease_until=?,attempts=attempts+1 WHERE admission_id=?",
                      (lease, now + lease_seconds, row[0]))
         conn.commit()
-        return {'event_id': row[0], 'turn_id': row[1], 'type': row[2], 'attempt': row[3] + 1, 'lease': lease}
+        event = {'event_id': row[0], 'turn_id': row[1], 'type': row[2], 'attempt': row[3] + 1, 'lease': lease}
+        if isinstance(row[4], str) and row[4] and len(row[4]) <= 240:
+            event['preview'] = row[4]
+        return event
     except BaseException:
         conn.rollback()
         raise
 
 
 def post_event(url, token, event):
-    payload = json.dumps({'event_id': event['event_id'], 'turn_id': event['turn_id'], 'type': event['type']},
+    data = {k: event[k] for k in ('event_id', 'turn_id', 'type')}
+    if event.get('preview'):
+        data['preview'] = event['preview']
+    payload = json.dumps(data,
                          separators=(',', ':')).encode('utf-8')
     req = urllib.request.Request(url, data=payload, method='POST',
         headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'})
@@ -70,12 +78,12 @@ def post_event(url, token, event):
         return None
 
 
-def send_one(conn, url, token, *, now=None, transport=post_event):
+def send_one(conn, url, token, *, now=None, transport=post_event, include_preview=False):
     """Attempt one event. An ambiguous network result retries the same event ID."""
     validate_config(url, token)
     simulated_time = now is not None
     now = int(time.time()) if now is None else int(now)
-    event = claim(conn, now)
+    event = claim(conn, now, include_preview=include_preview)
     if event is None:
         return 'empty'
     status = transport(url, token, event)
@@ -88,7 +96,9 @@ def send_one(conn, url, token, *, now=None, transport=post_event):
         next_attempt = now + min(3600, 2 ** min(event['attempt'], 11))
     conn.execute('BEGIN IMMEDIATE')
     try:
-        changed = conn.execute('''UPDATE piper_turn_outbox SET state=?,next_attempt=?,lease_token=NULL,lease_until=NULL,terminal_at=?
+        columns = {r[1] for r in conn.execute('PRAGMA table_info(piper_turn_outbox)')}
+        clear_preview = ',preview=NULL' if state == 'sent' and 'preview' in columns else ''
+        changed = conn.execute(f'''UPDATE piper_turn_outbox SET state=?,next_attempt=?,lease_token=NULL,lease_until=NULL,terminal_at=?{clear_preview}
             WHERE admission_id=? AND state='leased' AND lease_token=?''',
             (state, next_attempt, (now if simulated_time else int(time.time())) if state in ('sent', 'blocked') else None, event['event_id'], event['lease'])).rowcount
         conn.commit()

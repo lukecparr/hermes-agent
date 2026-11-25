@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import sqlite3
 import sys
+import subprocess
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -18,17 +19,28 @@ from gateway.piper_outbox_sender import send_one, validate_config
 LOG = logging.getLogger("piper-completion-worker")
 
 
-def run(conn, url, token, *, once=False, interval=10, send=send_one, sleep=time.sleep):
+def run(conn, url, token, *, once=False, interval=10, send=send_one, sleep=time.sleep, on_sent=None):
     """Drain due rows; sleep between empty or failed passes. Leases fence other workers."""
     validate_config(url, token)
     while True:
         result = send(conn, url, token)
         if result == "blocked":
             LOG.error("Completion delivery blocked by receiver; operator action required")
+        if result == "sent" and on_sent is not None:
+            try:
+                on_sent()
+            except Exception:
+                LOG.warning("Immediate dispatch wake failed; timer remains the retry safety net")
         if once:
             return result
         if result != "sent":
             sleep(interval)
+
+
+def dispatch_wake(helper):
+    """Operator-owned helper already holding cron auth; no event content or shell expansion."""
+    subprocess.run([sys.executable, str(helper)], check=True, timeout=40,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def main(argv=None):
@@ -36,6 +48,7 @@ def main(argv=None):
     parser.add_argument("--database", required=True, help="existing gateway SQLite database path")
     parser.add_argument("--once", action="store_true", help="attempt at most one row and exit")
     parser.add_argument("--interval", type=int, default=10, help="seconds between idle/retry checks (1-300)")
+    parser.add_argument("--dispatch-helper", help="existing trusted Python cron helper to wake after successful ingest")
     args = parser.parse_args(argv)
     if not 1 <= args.interval <= 300:
         parser.error("interval must be 1-300 seconds")
@@ -45,7 +58,11 @@ def main(argv=None):
         validate_config(url, token)
         path = Path(args.database).expanduser().resolve(strict=True)
         with sqlite3.connect(path.as_uri() + "?mode=rw", uri=True, timeout=10) as conn:
-            run(conn, url, token, once=args.once, interval=args.interval)
+            from functools import partial
+            send = partial(send_one, include_preview=os.environ.get('PIPER_COMPLETION_PREVIEW') == '1')
+            helper = Path(args.dispatch_helper).resolve(strict=True) if args.dispatch_helper else None
+            wake = partial(dispatch_wake, helper) if helper else None
+            run(conn, url, token, once=args.once, interval=args.interval, send=send, on_sent=wake)
     except (ValueError, OSError, sqlite3.Error):
         LOG.error("Completion worker could not start or access its outbox")
         return 1

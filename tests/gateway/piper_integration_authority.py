@@ -27,7 +27,7 @@ shutil.copytree(repo / 'contrib/piper-turn-outbox', home / 'plugins/piper-turn-o
 (home / 'config.yaml').write_text(
     'gateway:\n  required_settlement_plugins: [piper-turn-outbox]\n'
     'plugins:\n  enabled: [piper-turn-outbox]\n  entries:\n    piper-turn-outbox:\n'
-    f'      settings:\n        route: "{route}"\n')
+    f'      settings:\n        include_preview: true\n        route: "{route}"\n')
 path = home / 'state.db'
 db = SessionDB(path)
 epoch = begin_runtime_epoch(db, instance_id='integration')
@@ -43,7 +43,9 @@ owner = SessionAuthority(runner, profile_id=str(home), instance_id='integration'
 runner.session_authority = owner
 live = LiveSession(None, route)
 owner.sessions[session] = live
-captured = {'result': {'final_response': 'synthetic answer', 'messages': [], 'completed': True,
+captured = {'result': {'final_response': '**Hello** <b>Luke</b> &amp; hi',
+                       'messages': [{'role': 'tool', 'content': 'PRIVATE TOOL RESULT'},
+                                    {'role': 'assistant', 'reasoning': 'PRIVATE REASONING'}], 'completed': True,
                        'already_sent': True, '_notification_reply_muted': False}, 'usage': {}}
 if os.environ.get('PIPER_TEST_RECOVERY') == '1':
     owner.pending_results[row['admission_id']] = captured
@@ -61,6 +63,17 @@ else:
     assert settlement['settled']['outcome'] == 'completed'
 with sqlite3.connect(path, isolation_level=None) as conn:
     assert conn.execute('SELECT count(*) FROM piper_turn_outbox').fetchone()[0] == 1
-    assert send_one(conn, sys.argv[1], 'x' * 32) == 'sent'
+    if os.environ.get('PIPER_TEST_LOCAL_WAKE') == '1':
+        from functools import partial
+        from urllib.request import Request, urlopen
+        from scripts.piper_completion_worker import run
+        def wake():
+            with urlopen(Request(sys.argv[1] + 'wake', data=b'', method='POST',
+                                 headers={'Authorization': 'Bearer ' + 'x' * 32}), timeout=10) as response:
+                assert response.status == 204
+        assert run(conn, sys.argv[1], 'x' * 32, once=True,
+                   send=partial(send_one, include_preview=True), on_sent=wake) == 'sent'
+    else:
+        assert send_one(conn, sys.argv[1], 'x' * 32, include_preview=True) == 'sent'
 print('AUTHORITY_SETTLED', a['admission_id'], flush=True)
 db.close()

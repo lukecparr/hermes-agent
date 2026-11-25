@@ -52,6 +52,30 @@ def test_no_missing_database_creation(tmp_path, monkeypatch):
     assert not missing.exists()
 
 
+@pytest.mark.parametrize('result', ['sent', 'empty', 'pending', 'blocked', 'lease_lost'])
+def test_dispatch_wakes_only_after_new_success(result):
+    calls = []
+    assert worker.run(None, URL, TOKEN, once=True, send=lambda *_: result,
+                      on_sent=lambda: calls.append('wake')) == result
+    assert calls == (['wake'] if result == 'sent' else [])
+
+
+def test_wake_failure_keeps_durable_ack(caplog):
+    def fail():
+        raise RuntimeError('private auth must not be logged')
+    assert worker.run(None, URL, TOKEN, once=True, send=lambda *_: 'sent', on_sent=fail) == 'sent'
+    assert 'timer remains the retry safety net' in caplog.text
+    assert 'private auth' not in caplog.text
+
+
+def test_helper_runs_without_shell_or_event_content(tmp_path):
+    helper = tmp_path / 'dispatch.py'
+    marker = tmp_path / 'called'
+    helper.write_text(f"from pathlib import Path; Path({str(marker)!r}).write_text('called')")
+    worker.dispatch_wake(helper)
+    assert marker.read_text() == 'called'
+
+
 def test_bad_configuration_fails_closed(tmp_path, monkeypatch):
     db = tmp_path / 'state.db'
     db.touch()
