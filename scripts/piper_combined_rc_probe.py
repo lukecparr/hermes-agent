@@ -7,6 +7,8 @@ sb_root=Path(os.environ['PIPER_TEST_SB_ROOT']).resolve()
 sys.path[:0]=[str(root),str(plugin/'tests')]
 from e2e_probe import Model, free_port, http, CHAT, KEY, PREFIX
 TOKEN='z'*40
+# Run both modes: streaming returns None to avoid a duplicate adapter send.
+STREAMING = os.environ.get('PIPER_TEST_STREAMING') == '1'
 CHARM_TOKEN='c'*40
 
 async def main():
@@ -37,16 +39,16 @@ async def main():
       async with websockets.serve(connector,'127.0.0.1',0) as relay:
         url=f'http://127.0.0.1:{model.server_port}/v1'
         os.environ.update(OPENAI_BASE_URL=url,GATEWAY_RELAY_URL=f"ws://127.0.0.1:{relay.sockets[0].getsockname()[1]}/relay",GATEWAY_RELAY_PLATFORMS='telegram',GATEWAY_RELAY_BOT_IDS='{"telegram":"fixture-bot"}',GATEWAY_RELAY_ID='fixture-gateway',GATEWAY_RELAY_SECRET='fixture-secret',API_SERVER_ENABLED='true',TELEGRAM_ALLOWED_USERS=CHAT,API_SERVER_HOST='127.0.0.1',API_SERVER_PORT=str(port),API_SERVER_KEY='api-key-not-used-by-shared-thread-0123456789')
-        cfg={'gateway':{'multiplex_profiles':False,'optional_settlement_plugins':['piper-turn-outbox']},'model':{'provider':'custom','default':'local-fixture','base_url':url},'streaming':{'enabled':False},'terminal':{'cwd':str(home)},'approvals':{'mode':'off'},'auxiliary':{'title_generation':{'enabled':False}},'plugins':{'isolation':'in_process','enabled':['piper-shared-thread','piper-turn-outbox'],'entries':{'piper-shared-thread':{'allow_gateway_injection':True,'settings':{'session_key':KEY,'command_wait_s':2}},'piper-turn-outbox':{'settings':{'route':KEY}}}}}
+        cfg={'gateway':{'multiplex_profiles':False,'optional_settlement_plugins':['piper-turn-outbox']},'model':{'provider':'custom','default':'local-fixture','base_url':url},'streaming':{'enabled':STREAMING},'terminal':{'cwd':str(home)},'approvals':{'mode':'off'},'auxiliary':{'title_generation':{'enabled':False}},'plugins':{'isolation':'in_process','enabled':['piper-shared-thread','piper-turn-outbox'],'entries':{'piper-shared-thread':{'allow_gateway_injection':True,'settings':{'session_key':KEY,'command_wait_s':2}},'piper-turn-outbox':{'settings':{'route':KEY}}}}}
         (home/'config.yaml').write_text(json.dumps(cfg))
         from gateway.run import start_gateway
         task=asyncio.create_task(start_gateway(verbosity=None))
         try:
           ws=await asyncio.wait_for(ready.get(),40)
-          from tests.gateway.test_normal_runtime_boot import control
+          from gateway.control_socket import query_gateway_control
           for _ in range(300):
             try:
-              if (await asyncio.to_thread(control,home,'identify')).get('state')=='ready': break
+              if ((await asyncio.to_thread(query_gateway_control,home,'identify')) or {}).get('state')=='ready': break
             except (OSError,ValueError,AssertionError): pass
             await asyncio.sleep(.1)
           else: raise AssertionError('gateway not ready')
@@ -84,6 +86,10 @@ async def main():
           assert st==200,(st,reply)
           with sqlite3.connect(f'file:{home / "state.db"}?mode=ro',uri=True) as db:
               rows=db.execute('select a.principal_id,a.request_id,o.turn_id,o.state from piper_turn_outbox o join session_admissions a on a.admission_id=o.admission_id').fetchall()
+              results=[json.loads(r[0])['result'] for r in db.execute(
+                  "select value from state_meta where key like 'gateway.admission.result.v1.%'")]
+          if STREAMING:
+              assert len(results)==3 and all(r.get('already_sent') is True for r in results), 'stream suppression was not exercised for every surface'
           assert len(rows)==3,rows
           assert sum(p.startswith('messaging:') for p,_,_,_ in rows)==1,rows
           assert sum('charm' in req for _,req,_,_ in rows)==1,rows

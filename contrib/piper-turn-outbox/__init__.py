@@ -9,8 +9,13 @@ def register(ctx):
 
     def settle(*, conn, row, route, response, outcome, result):
         agent_result = (result or {}).get('result') or {}
-        if agent_result.get('completed') is not True:
+        if agent_result.get('completed') is not True or agent_result.get('_notification_reply_muted') is True:
             return
+        # None is the adapter's "already delivered" return for a streamed reply,
+        # not proof that inference produced no answer. Keep delivery suppression
+        # unchanged; only eligibility uses the captured, completed answer.
+        if response is None and agent_result.get('already_sent') is True:
+            response = agent_result.get('final_response')
         turn_id = eligible_turn(row, route, response, outcome, configured=configured_route)
         if turn_id is not None:
             insert_completion(conn, row['admission_id'], turn_id)

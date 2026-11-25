@@ -43,6 +43,7 @@ try {
     try {
       const env = {PATH:process.env.PATH, HOME:home, TMPDIR:home, HERMES_HOME:home,
         HERMES_RUNTIME_DIR:join(home, 'runtime'), PIPER_TEST_PYTHON:python,
+        ...(process.env.PIPER_TEST_PYTHONPATH ? {PYTHONPATH:process.env.PIPER_TEST_PYTHONPATH} : {}),
         PIPER_TEST_SB_REPO:sb, PIPER_TEST_HERMES_REPO:repo, PIPER_TEST_RECOVERY:recovery ? '1' : '0',
         POSTGRES_URL:`postgresql://postgres:postgres@127.0.0.1:${port}/postgres?sslmode=disable&connection_limit=1&pgbouncer=true`,
         PIPER_PUSH_RECEIVER:'1', PIPER_PUSH_INGEST_TOKEN:'x'.repeat(32)};
