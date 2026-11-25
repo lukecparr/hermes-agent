@@ -351,6 +351,7 @@ def desktop_env(base_env: Optional[dict[str, str]] = None) -> dict[str, str]:
         touch_activity()  # a browser / cua-driver spawn is the agent using its screen
         env.update(published)
         env.pop("WAYLAND_DISPLAY", None)  # X11 desktop; a leaked Wayland socket flips GTK/Chromium backends
+        env["XDG_SESSION_TYPE"] = "x11"  # Chromium otherwise chooses Wayland from the gateway's locked seat
     return env
 
 
