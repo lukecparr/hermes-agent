@@ -5,7 +5,7 @@ import unicodedata
 from agent.redact import redact_sensitive_text
 
 LIMIT = 240
-_INTERNAL = re.compile(r'<\s*/?\s*(?:think(?:ing)?|analysis|reasoning|tool(?:_call|_result)?|function_call)\b|(?:^|\n)\s*(?:assistant\s+to=|(?:analysis|tool|function)\s*:)', re.I)
+_INTERNAL = re.compile(r'<\s*/?\s*(?:think(?:ing)?|analysis|reasoning|tool(?:_call|_result)?|function_call)\b|(?:^|\n)\s*(?:assistant\s+to=|(?:analysis|tool|function)\s*:)', re.IGNORECASE)
 
 
 def sanitize_preview(value):
